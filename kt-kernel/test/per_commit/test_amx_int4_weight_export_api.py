@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
+from functools import cache
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ from ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="default")
 
 
+@cache
 def _load_amx_module():
     """Load utils/amx.py with only its import-time dependencies stubbed."""
 
@@ -80,6 +82,23 @@ def test_amx_int4_wrapper_forwards_export_submit_and_sync() -> None:
     wrapper.moe.write_weight_scale_to_buffer_task.return_value = task
 
     arguments = (2, 17, [101, 102], [0, 0], [201, 202], [0, 0])
+    wrapper.submit_write_weight_scale_to_buffer(*arguments)
+    wrapper.sync_write_weight_scale_to_buffer()
+
+    wrapper.moe.write_weight_scale_to_buffer_task.assert_called_once_with(*arguments)
+    wrapper.cpu_infer.submit.assert_called_once_with(task)
+    wrapper.cpu_infer.sync.assert_called_once_with()
+
+
+def test_amx_int4_wrapper_forwards_single_gpu_complete_expert_export() -> None:
+    amx = _load_amx_module()
+    wrapper = object.__new__(amx.AMXMoEWrapper)
+    wrapper.moe = MagicMock()
+    wrapper.cpu_infer = MagicMock()
+    task = object()
+    wrapper.moe.write_weight_scale_to_buffer_task.return_value = task
+
+    arguments = (1, 129, [101], [0], [201], [0])
     wrapper.submit_write_weight_scale_to_buffer(*arguments)
     wrapper.sync_write_weight_scale_to_buffer()
 

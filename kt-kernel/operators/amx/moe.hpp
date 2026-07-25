@@ -15,6 +15,8 @@
 // #define FORWARD_TIME_REPORT
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 #include "moe_base.hpp"
 
@@ -225,75 +227,87 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
    * chunk as BF16 on each tensor-parallel GPU.  BufferBInt4Impl::to_mat()
    * reverses the AMX/VNNI packing and applies the stored per-output scale.
    *
-   * This first implementation deliberately requires a one-to-one mapping
-   * between CPU NUMA/TP parts and GPU TP ranks.  That is the dwagon
-   * PP=1/TP=2 topology and avoids silently introducing cross-NUMA assembly
-   * traffic.  A future implementation can add explicit scatter/gather for
-   * unequal CPU/GPU partition counts.
+   * The ordinary path preserves the one-to-one CPU/GPU TP mapping.  SmallEP
+   * additionally admits gpu_tp_count=1: every CPU/NUMA part dequantizes its
+   * shard, and the shards are assembled into one complete BF16 expert owned
+   * by a single GPU.
    */
   void write_weights_to_bf16_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id,
-                                    const GeneralMOEConfig& full_config,
-                                    const std::vector<uintptr_t>& w13_weight_ptrs,
+                                    const GeneralMOEConfig& full_config, const std::vector<uintptr_t>& w13_weight_ptrs,
                                     const std::vector<uintptr_t>& w2_weight_ptrs) const {
-    if (gpu_tp_count != cpu_tp_count) {
-      throw std::runtime_error(
-          "AMXINT4 BF16 export requires gpu_tp_count == cpu_tp_count");
+    const bool assemble_complete_expert = gpu_tp_count == 1 && cpu_tp_count > 1;
+    if (gpu_tp_count != cpu_tp_count && !assemble_complete_expert) {
+      throw std::runtime_error("AMXINT4 BF16 export requires GPU TP to match CPU TP or equal 1");
     }
-    if (tp_part_idx < 0 || tp_part_idx >= gpu_tp_count) {
+    if (tp_part_idx < 0 || tp_part_idx >= cpu_tp_count) {
       throw std::runtime_error("AMXINT4 BF16 export TP part is out of range");
     }
     if (expert_id < 0 || expert_id >= config_.expert_num) {
       throw std::runtime_error("AMXINT4 BF16 export expert_id is out of range");
     }
-    if ((int)w13_weight_ptrs.size() != gpu_tp_count ||
-        (int)w2_weight_ptrs.size() != gpu_tp_count ||
-        w13_weight_ptrs[tp_part_idx] == 0 ||
-        w2_weight_ptrs[tp_part_idx] == 0) {
-      throw std::runtime_error(
-          "AMXINT4 BF16 export requires one non-null weight pointer per GPU TP rank");
+    if ((int)w13_weight_ptrs.size() != gpu_tp_count || (int)w2_weight_ptrs.size() != gpu_tp_count ||
+        w13_weight_ptrs[assemble_complete_expert ? 0 : tp_part_idx] == 0 ||
+        w2_weight_ptrs[assemble_complete_expert ? 0 : tp_part_idx] == 0) {
+      throw std::runtime_error("AMXINT4 BF16 export requires one non-null weight pointer per GPU TP rank");
     }
 
-    const int gpu_intermediate_size =
-        full_config.intermediate_size / gpu_tp_count;
-    if (full_config.intermediate_size % gpu_tp_count != 0 ||
-        gpu_intermediate_size != config_.intermediate_size ||
+    const int cpu_intermediate_size = full_config.intermediate_size / cpu_tp_count;
+    if (full_config.intermediate_size % cpu_tp_count != 0 || cpu_intermediate_size != config_.intermediate_size ||
         full_config.hidden_size != config_.hidden_size) {
-      throw std::runtime_error(
-          "AMXINT4 BF16 export CPU/GPU tensor partitions do not match");
+      throw std::runtime_error("AMXINT4 BF16 export CPU/GPU tensor partitions do not match");
     }
 
-    auto* w13 = reinterpret_cast<ggml_bf16_t*>(
-        w13_weight_ptrs[tp_part_idx]);
-    auto* w2 = reinterpret_cast<ggml_bf16_t*>(
-        w2_weight_ptrs[tp_part_idx]);
-    const size_t projection_elements =
-        (size_t)config_.intermediate_size * config_.hidden_size;
+    const int destination_index = assemble_complete_expert ? 0 : tp_part_idx;
+    auto* w13 = reinterpret_cast<ggml_bf16_t*>(w13_weight_ptrs[destination_index]);
+    auto* w2 = reinterpret_cast<ggml_bf16_t*>(w2_weight_ptrs[destination_index]);
+    const size_t projection_elements = (size_t)config_.intermediate_size * config_.hidden_size;
+    const size_t full_projection_elements = (size_t)full_config.intermediate_size * config_.hidden_size;
+    auto* gate_destination = w13 + (assemble_complete_expert ? (size_t)tp_part_idx * projection_elements : 0);
+    auto* up_destination =
+        w13 + (assemble_complete_expert ? full_projection_elements + (size_t)tp_part_idx * projection_elements
+                                        : projection_elements);
+    std::vector<ggml_bf16_t> local_down;
+    auto* down_destination = w2;
+    if (assemble_complete_expert) {
+      local_down.resize(projection_elements);
+      down_destination = local_down.data();
+    }
 
     const int gate_up_tasks = T::recommended_nth(config_.intermediate_size);
     const int down_tasks = T::recommended_nth(config_.hidden_size);
     auto pool = config_.pool->get_subpool(tp_part_idx);
-    if constexpr (requires(typename T::BufferB& buffer,
-                           ggml_bf16_t* destination) {
+    if constexpr (requires(typename T::BufferB& buffer, ggml_bf16_t* destination) {
                     buffer.to_mat(destination, 0, 1);
                   }) {
       pool->do_work_stealing_job(
           gate_up_tasks * 2 + down_tasks, nullptr,
           [=, this](int task_id) {
             if (task_id < gate_up_tasks) {
-              gate_bb_[expert_id]->to_mat(w13, task_id, gate_up_tasks);
+              gate_bb_[expert_id]->to_mat(gate_destination, task_id, gate_up_tasks);
             } else if (task_id < gate_up_tasks * 2) {
               const int ith = task_id - gate_up_tasks;
-              up_bb_[expert_id]->to_mat(
-                  w13 + projection_elements, ith, gate_up_tasks);
+              up_bb_[expert_id]->to_mat(up_destination, ith, gate_up_tasks);
             } else {
               const int ith = task_id - gate_up_tasks * 2;
-              down_bb_[expert_id]->to_mat(w2, ith, down_tasks);
+              down_bb_[expert_id]->to_mat(down_destination, ith, down_tasks);
             }
           },
           nullptr);
+      if (assemble_complete_expert) {
+        pool->do_work_stealing_job(
+            down_tasks, nullptr,
+            [this, w2, &local_down, &full_config, down_tasks](int task_id) {
+              for (int row = task_id; row < config_.hidden_size; row += down_tasks) {
+                std::memcpy(
+                    w2 + (size_t)row * full_config.intermediate_size + (size_t)tp_part_idx * config_.intermediate_size,
+                    local_down.data() + (size_t)row * config_.intermediate_size,
+                    (size_t)config_.intermediate_size * sizeof(ggml_bf16_t));
+              }
+            },
+            nullptr);
+      }
     } else {
-      throw std::runtime_error(
-          "selected AMXINT4 BufferB cannot export BF16 stream weights");
+      throw std::runtime_error("selected AMXINT4 BufferB cannot export BF16 stream weights");
     }
   }
 
@@ -541,44 +555,35 @@ class TP_MOE<AMX_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_MOE_TP<K>>> {
     }
   }
 
-  void write_weight_scale_to_buffer(
-      int gpu_tp_count, int expert_id,
-      const std::vector<uintptr_t>& w13_weight_ptrs,
-      const std::vector<uintptr_t>& w13_scale_ptrs,
-      const std::vector<uintptr_t>& w2_weight_ptrs,
-      const std::vector<uintptr_t>& w2_scale_ptrs) {
+  void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
+                                    const std::vector<uintptr_t>& w13_scale_ptrs,
+                                    const std::vector<uintptr_t>& w2_weight_ptrs,
+                                    const std::vector<uintptr_t>& w2_scale_ptrs) {
     if (!this->weights_loaded) {
       throw std::runtime_error("Not Loaded");
     }
     if (this->tps.empty()) {
       throw std::runtime_error("No TP parts initialized");
     }
-    if ((int)w13_weight_ptrs.size() != gpu_tp_count ||
-        (int)w2_weight_ptrs.size() != gpu_tp_count) {
-      throw std::runtime_error(
-          "AMXINT4 BF16 export pointer arrays must match gpu_tp_count");
+    if ((int)w13_weight_ptrs.size() != gpu_tp_count || (int)w2_weight_ptrs.size() != gpu_tp_count) {
+      throw std::runtime_error("AMXINT4 BF16 export pointer arrays must match gpu_tp_count");
     }
     // AMXINT4 is dequantized to BF16, so scale destinations are intentionally
     // unused.  Reject partially populated arrays because that usually means a
     // caller selected an incompatible quantized GPU shadow layout.
     if ((!w13_scale_ptrs.empty() &&
-         std::any_of(w13_scale_ptrs.begin(), w13_scale_ptrs.end(),
-                     [](uintptr_t ptr) { return ptr != 0; })) ||
+         std::any_of(w13_scale_ptrs.begin(), w13_scale_ptrs.end(), [](uintptr_t ptr) { return ptr != 0; })) ||
         (!w2_scale_ptrs.empty() &&
-         std::any_of(w2_scale_ptrs.begin(), w2_scale_ptrs.end(),
-                     [](uintptr_t ptr) { return ptr != 0; }))) {
-      throw std::runtime_error(
-          "AMXINT4 BF16 export does not accept GPU scale destinations");
+         std::any_of(w2_scale_ptrs.begin(), w2_scale_ptrs.end(), [](uintptr_t ptr) { return ptr != 0; }))) {
+      throw std::runtime_error("AMXINT4 BF16 export does not accept GPU scale destinations");
     }
-    if (gpu_tp_count != this->tp_count) {
-      throw std::runtime_error(
-          "AMXINT4 BF16 export requires GPU TP to match CPU NUMA/TP count");
+    if (gpu_tp_count != this->tp_count && gpu_tp_count != 1) {
+      throw std::runtime_error("AMXINT4 BF16 export requires GPU TP to match CPU NUMA/TP count or equal 1");
     }
 
     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
-      this->tps[i]->write_weights_to_bf16_buffer(
-          gpu_tp_count, this->tp_count, expert_id, this->config,
-          w13_weight_ptrs, w2_weight_ptrs);
+      this->tps[i]->write_weights_to_bf16_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
+                                                 w2_weight_ptrs);
     });
   }
 
