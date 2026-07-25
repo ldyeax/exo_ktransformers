@@ -272,21 +272,29 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     const int gate_up_tasks = T::recommended_nth(config_.intermediate_size);
     const int down_tasks = T::recommended_nth(config_.hidden_size);
     auto pool = config_.pool->get_subpool(tp_part_idx);
-    pool->do_work_stealing_job(
-        gate_up_tasks * 2 + down_tasks, nullptr,
-        [=, this](int task_id) {
-          if (task_id < gate_up_tasks) {
-            gate_bb_[expert_id]->to_mat(w13, task_id, gate_up_tasks);
-          } else if (task_id < gate_up_tasks * 2) {
-            const int ith = task_id - gate_up_tasks;
-            up_bb_[expert_id]->to_mat(
-                w13 + projection_elements, ith, gate_up_tasks);
-          } else {
-            const int ith = task_id - gate_up_tasks * 2;
-            down_bb_[expert_id]->to_mat(w2, ith, down_tasks);
-          }
-        },
-        nullptr);
+    if constexpr (requires(typename T::BufferB& buffer,
+                           ggml_bf16_t* destination) {
+                    buffer.to_mat(destination, 0, 1);
+                  }) {
+      pool->do_work_stealing_job(
+          gate_up_tasks * 2 + down_tasks, nullptr,
+          [=, this](int task_id) {
+            if (task_id < gate_up_tasks) {
+              gate_bb_[expert_id]->to_mat(w13, task_id, gate_up_tasks);
+            } else if (task_id < gate_up_tasks * 2) {
+              const int ith = task_id - gate_up_tasks;
+              up_bb_[expert_id]->to_mat(
+                  w13 + projection_elements, ith, gate_up_tasks);
+            } else {
+              const int ith = task_id - gate_up_tasks * 2;
+              down_bb_[expert_id]->to_mat(w2, ith, down_tasks);
+            }
+          },
+          nullptr);
+    } else {
+      throw std::runtime_error(
+          "selected AMXINT4 BufferB cannot export BF16 stream weights");
+    }
   }
 
   void load_weights() {
