@@ -492,9 +492,12 @@ struct BufferASmallKGroupImpl : public BufferAKGroupImpl<K> {
 template <typename K>
 struct BufferBInt4Impl {
   using dt = typename K::dt;
+  // BufferB is a non-owning view in both the legacy copied mode and the
+  // file-mapped mode. Its destructor never frees b or d.
   dt* b;
   float* d;
   int n, k;
+  bool external_readonly = false;
 
   static constexpr int N_STEP = K::N_STEP;
   static constexpr int N_BLOCK = K::N_BLOCK;
@@ -508,15 +511,42 @@ struct BufferBInt4Impl {
   static size_t required_size(int n, int k) { return sizeof(int8_t) * n * k / 2 + sizeof(float) * n; }
 
   BufferBInt4Impl(int n, int k, void* ptr) : n(n), k(k) {
-    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
     assert(n % N_STEP == 0);
     assert(k % B_K_STEP == 0);
     if (n % N_STEP || k % B_K_STEP) {
       printf("n: %d, k: %d, N_STEP: %d, B_K_STEP: %d\n", n, k, N_STEP, B_K_STEP);
       throw std::runtime_error("n or k is not aligned to N_STEP or B_K_STEP");
     }
+    if (ptr == nullptr) {
+      b = nullptr;
+      d = nullptr;
+      return;
+    }
+    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
     b = reinterpret_cast<dt*>(ptr);
     d = reinterpret_cast<float*>(offset_pointer(b, n * k / 2));
+  }
+
+  ~BufferBInt4Impl() = default;
+
+  void set_external_readonly_data(const void* packed_weight, const void* scales) {
+    if (packed_weight == nullptr || scales == nullptr) {
+      throw std::runtime_error("AMXINT4 external weight pointers cannot be null");
+    }
+    // safetensors guarantees 8-byte tensor offsets. GemmKernel224Int4 uses
+    // unaligned AVX-512 loads for packed tiles/scales, so 8-byte alignment is
+    // sufficient here (and float alignment keeps the typed scale view valid).
+    if (reinterpret_cast<uintptr_t>(packed_weight) % 8 != 0 ||
+        reinterpret_cast<uintptr_t>(scales) % alignof(float) != 0) {
+      throw std::runtime_error("AMXINT4 external weight pointers are not suitably aligned");
+    }
+    // safetensors maps are protected PROT_READ by the Python lifecycle before
+    // these addresses are exposed.  BufferB predates const-correct kernel
+    // signatures, so retain its pointer types while recording the immutable
+    // ownership mode explicitly.
+    b = reinterpret_cast<dt*>(const_cast<void*>(packed_weight));
+    d = reinterpret_cast<float*>(const_cast<void*>(scales));
+    external_readonly = true;
   }
 
   static __m128i round_4bit_s8(__m128i x) {

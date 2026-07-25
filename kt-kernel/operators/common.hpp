@@ -294,6 +294,11 @@ struct GeneralMOEConfig {
   std::string path;
   bool save = false;
   bool load = false;
+  // Bind AMXINT4 BufferB directly to immutable, file-mapped safetensors
+  // storage.  The Python loader owns and read-protects the mappings for the
+  // full lifetime of the MoE object.  No kernel may write through these
+  // pointers and unsupported BufferB implementations fail closed at load.
+  bool share_host_weights = false;
   bool share_backward_bb = false;
   bool share_cache_pool = false;
 

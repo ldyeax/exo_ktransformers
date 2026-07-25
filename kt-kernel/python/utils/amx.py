@@ -1,25 +1,32 @@
+import ctypes
 import gc
 import logging
 import os
-import torch
-import ctypes
+import threading
+from pathlib import Path
 from typing import List, Optional
+
+import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
 # Use relative imports for package structure
+import kt_kernel_ext.moe as _moe_mod
+from kt_kernel_ext.moe import MOEConfig
+
 from ..experts_base import BaseMoEWrapper
 from .loader import (
-    SafeTensorLoader,
+    BF16SafeTensorLoader,
     CompressedSafeTensorLoader,
     FP8SafeTensorLoader,
-    BF16SafeTensorLoader,
     GPTQSafeTensorLoader,
     MXFP4SafeTensorLoader,
     MXFP8SafeTensorLoader,
+    SafeTensorLoader,
+    SharedSafeTensorLoader,
 )
-from kt_kernel_ext.moe import MOEConfig
-import kt_kernel_ext.moe as _moe_mod
+from .shared_host_weights import SharedHostWeightError, SharedHostWeightLease
 
 AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
@@ -226,6 +233,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
     """
 
     _safetensor_loader_instance = None  # Singleton SafeTensorLoader
+    _shared_host_weight_lease: Optional[SharedHostWeightLease] = None
+    _shared_host_weight_lock = threading.Lock()
 
     def __init__(
         self,
@@ -303,11 +312,98 @@ class AMXMoEWrapper(BaseMoEWrapper):
         if glob.glob(os.path.join(weight_path, "*.safetensors")):
             self.load_merged_weight = True
 
+        shared_host_weight_setting = os.environ.get("KT_SHARED_HOST_WEIGHTS", "")
+        if shared_host_weight_setting not in {"", "0", "1"}:
+            raise SharedHostWeightError(
+                "KT_SHARED_HOST_WEIGHTS must be exactly 0 or 1"
+            )
+        self.share_host_weights = shared_host_weight_setting == "1"
+        shared_host_weight_lease: Optional[SharedHostWeightLease] = None
+        self._shared_host_weight_numa_nodes: tuple[int, ...] = ()
+        if self.share_host_weights:
+            if method != "AMXINT4":
+                raise SharedHostWeightError(
+                    "direct shared host weights currently support AMXINT4 only"
+                )
+            if cpu_save:
+                raise SharedHostWeightError(
+                    "shared host weights cannot be combined with online quantization"
+                )
+            if not self.load_merged_weight:
+                raise SharedHostWeightError(
+                    "shared host weights require merged safetensors input"
+                )
+            manifest_value = os.environ.get(
+                "KT_SHARED_HOST_WEIGHTS_MANIFEST", ""
+            )
+            state_value = os.environ.get("KT_SHARED_HOST_WEIGHTS_STATE_DIR", "")
+            expected_content_id = os.environ.get(
+                "KT_SHARED_HOST_WEIGHTS_CONTENT_ID", ""
+            )
+            if not manifest_value or not state_value or not expected_content_id:
+                raise SharedHostWeightError(
+                    "shared host weights require manifest, state directory, "
+                    "and content identity environment variables"
+                )
+            effective_numa_nodes = tuple(
+                numa_nodes if numa_nodes is not None else range(threadpool_count)
+            )
+            self._shared_host_weight_numa_nodes = effective_numa_nodes
+            with AMXMoEWrapper._shared_host_weight_lock:
+                if AMXMoEWrapper._shared_host_weight_lease is None:
+                    AMXMoEWrapper._shared_host_weight_lease = (
+                        SharedHostWeightLease(
+                            checkpoint_root=Path(weight_path),
+                            manifest_path=Path(manifest_value),
+                            state_directory=Path(state_value),
+                            expected_content_id=expected_content_id,
+                            expected_numa_nodes=effective_numa_nodes,
+                        )
+                    )
+                shared_host_weight_lease = (
+                    AMXMoEWrapper._shared_host_weight_lease
+                )
+            if (
+                shared_host_weight_lease.checkpoint_root
+                != Path(weight_path).resolve(strict=True)
+                or shared_host_weight_lease.manifest.content_id
+                != expected_content_id
+                or shared_host_weight_lease.manifest.numa_nodes
+                != effective_numa_nodes
+            ):
+                raise SharedHostWeightError(
+                    "AMX wrapper attempted to reuse a different shared weight contract"
+                )
+
         # Initialize SafeTensor loader (singleton)
         if self.load_merged_weight:
-            if AMXMoEWrapper._safetensor_loader_instance is None:
-                AMXMoEWrapper._safetensor_loader_instance = SafeTensorLoader(weight_path)
-            self.safetensor_loader = AMXMoEWrapper._safetensor_loader_instance
+            with AMXMoEWrapper._shared_host_weight_lock:
+                if AMXMoEWrapper._safetensor_loader_instance is None:
+                    if self.share_host_weights:
+                        if shared_host_weight_lease is None:
+                            raise SharedHostWeightError(
+                                "shared host weight lease was not initialized"
+                            )
+                        AMXMoEWrapper._safetensor_loader_instance = (
+                            SharedSafeTensorLoader(
+                                weight_path, shared_host_weight_lease
+                            )
+                        )
+                    else:
+                        AMXMoEWrapper._safetensor_loader_instance = (
+                            SafeTensorLoader(weight_path)
+                        )
+                if self.share_host_weights and not isinstance(
+                    AMXMoEWrapper._safetensor_loader_instance,
+                    SharedSafeTensorLoader,
+                ):
+                    raise SharedHostWeightError(
+                        "shared host weights were enabled after a copying loader "
+                        "was created"
+                    )
+                self.safetensor_loader = (
+                    AMXMoEWrapper._safetensor_loader_instance
+                )
 
         # AMX-specific weight storage
         self.gate_weights = None
@@ -316,6 +412,72 @@ class AMXMoEWrapper(BaseMoEWrapper):
         self.gate_scales = None
         self.up_scales = None
         self.down_scales = None
+
+    def _validate_shared_host_weight_tables(self, weights) -> None:
+        numa_count = len(self._shared_host_weight_numa_nodes)
+        if numa_count == 0 or self.moe_intermediate_size % numa_count != 0:
+            raise SharedHostWeightError(
+                "shared AMXINT4 intermediate size is not divisible by its NUMA count"
+            )
+        intermediate_per_numa = self.moe_intermediate_size // numa_count
+        specifications = (
+            (
+                "gate",
+                np.dtype(np.int8),
+                intermediate_per_numa * self.hidden_size // 2,
+                8,
+            ),
+            (
+                "up",
+                np.dtype(np.int8),
+                intermediate_per_numa * self.hidden_size // 2,
+                8,
+            ),
+            (
+                "down",
+                np.dtype(np.int8),
+                self.hidden_size * intermediate_per_numa // 2,
+                8,
+            ),
+            (
+                "gate_scale",
+                np.dtype(np.float32),
+                intermediate_per_numa * 4,
+                4,
+            ),
+            (
+                "up_scale",
+                np.dtype(np.float32),
+                intermediate_per_numa * 4,
+                4,
+            ),
+            ("down_scale", np.dtype(np.float32), self.hidden_size * 4, 4),
+        )
+        for table_name, expected_dtype, expected_bytes, alignment in specifications:
+            table = weights.get(table_name)
+            if not isinstance(table, list) or len(table) != numa_count:
+                raise SharedHostWeightError(
+                    f"shared AMXINT4 {table_name} NUMA table is incomplete"
+                )
+            for numa_table in table:
+                if (
+                    not isinstance(numa_table, list)
+                    or len(numa_table) != self.num_experts
+                ):
+                    raise SharedHostWeightError(
+                        f"shared AMXINT4 {table_name} expert table is incomplete"
+                    )
+                for expert_tensor in numa_table:
+                    if (
+                        not isinstance(expert_tensor, np.ndarray)
+                        or expert_tensor.dtype != expected_dtype
+                        or not expert_tensor.flags.c_contiguous
+                        or expert_tensor.nbytes != expected_bytes
+                        or int(expert_tensor.ctypes.data) % alignment != 0
+                    ):
+                        raise SharedHostWeightError(
+                            f"shared AMXINT4 {table_name} tensor layout is invalid"
+                        )
 
     def load_weights_from_tensors(
         self,
@@ -396,6 +558,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         if self.load_merged_weight:
             base_key = f"blk.{self.layer_idx}"
             w = self.safetensor_loader.load_experts(base_key)
+            if self.share_host_weights:
+                self._validate_shared_host_weight_tables(w)
 
             self.gate_weights = w["gate"]
             self.up_weights = w["up"]
@@ -406,50 +570,32 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
             # Get pointers to weight arrays
             gate_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(expert_tensor.ctypes.data) for expert_tensor in numa_array]
                 for numa_array in self.gate_weights
             ]
 
             up_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(expert_tensor.ctypes.data) for expert_tensor in numa_array]
                 for numa_array in self.up_weights
             ]
 
             down_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(expert_tensor.ctypes.data) for expert_tensor in numa_array]
                 for numa_array in self.down_weights
             ]
 
             gate_scale_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(expert_tensor.ctypes.data) for expert_tensor in numa_array]
                 for numa_array in self.gate_scales
             ]
 
             up_scale_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(expert_tensor.ctypes.data) for expert_tensor in numa_array]
                 for numa_array in self.up_scales
             ]
 
             down_scale_ptrs = [
-                [
-                    ctypes.addressof(ctypes.cast(et.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents)
-                    for et in numa_array
-                ]
+                [int(expert_tensor.ctypes.data) for expert_tensor in numa_array]
                 for numa_array in self.down_scales
             ]
 
@@ -474,6 +620,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
+        moe_config.share_host_weights = self.share_host_weights
 
         if self.cpu_save:
             moe_config.save = True
@@ -511,7 +658,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
 
         # Clean up temporary weight storage if using merged weights
-        if self.load_merged_weight:
+        if self.load_merged_weight and not self.share_host_weights:
             del self.gate_weights
             del self.up_weights
             del self.down_weights

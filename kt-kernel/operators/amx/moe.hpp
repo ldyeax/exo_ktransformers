@@ -90,6 +90,15 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
     f.seekg(mat_split_idex * scale_size / mat_split);
     f.read((((char*)bb) + size - scale_size) + mat_split_idex * scale_size / mat_split, scale_size / mat_split);
   }
+
+  inline void bind_external_readonly_weight(const std::shared_ptr<typename T::BufferB>& buffer, const void* weight,
+                                            const void* scale) {
+    if constexpr (requires(typename T::BufferB& candidate) { candidate.set_external_readonly_data(weight, scale); }) {
+      buffer->set_external_readonly_data(weight, scale);
+    } else {
+      throw std::runtime_error("selected AMX BufferB does not support shared read-only host weights");
+    }
+  }
 #ifdef CHECK
   inline void load_check() {
     memcpy(check_bb, (char*)down_bb_[compare_expers]->b,
@@ -283,12 +292,35 @@ class AMX_MOE_TP : public AMX_MOE_BASE<T, AMX_MOE_TP<T>> {
   void load_weights() {
     auto pool = config_.pool->get_subpool(tp_part_idx);
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
+    if (config_.share_host_weights && config_.gate_projs.empty()) {
+      throw std::runtime_error("shared AMXINT4 weights require an external pointer table");
+    }
     if (config_.gate_projs.size()) {
       pool->do_work_stealing_job(
           config_.expert_num, nullptr,
           [this, physical_to_logical_map](int expert_id) {
             // printf("Load layer %d [%d/%d]\n", config_.layer_idx, expert_id, config_.expert_num);
             uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_id);
+            if (config_.share_host_weights) {
+              if (config_.gate_scales.size() <= static_cast<size_t>(tp_part_idx) ||
+                  config_.up_scales.size() <= static_cast<size_t>(tp_part_idx) ||
+                  config_.down_scales.size() <= static_cast<size_t>(tp_part_idx) ||
+                  config_.gate_projs[tp_part_idx].size() <= logical_expert_id ||
+                  config_.up_projs[tp_part_idx].size() <= logical_expert_id ||
+                  config_.down_projs[tp_part_idx].size() <= logical_expert_id ||
+                  config_.gate_scales[tp_part_idx].size() <= logical_expert_id ||
+                  config_.up_scales[tp_part_idx].size() <= logical_expert_id ||
+                  config_.down_scales[tp_part_idx].size() <= logical_expert_id) {
+                throw std::runtime_error("incomplete shared AMXINT4 expert pointer table");
+              }
+              bind_external_readonly_weight(gate_bb_[expert_id], config_.gate_projs[tp_part_idx][logical_expert_id],
+                                            config_.gate_scales[tp_part_idx][logical_expert_id]);
+              bind_external_readonly_weight(up_bb_[expert_id], config_.up_projs[tp_part_idx][logical_expert_id],
+                                            config_.up_scales[tp_part_idx][logical_expert_id]);
+              bind_external_readonly_weight(down_bb_[expert_id], config_.down_projs[tp_part_idx][logical_expert_id],
+                                            config_.down_scales[tp_part_idx][logical_expert_id]);
+              return;
+            }
             {
               size_t scale_size = config_.intermediate_size * sizeof(float);
               size_t size = T::BufferB::required_size(config_.intermediate_size, config_.hidden_size) - scale_size;

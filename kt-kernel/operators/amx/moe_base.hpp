@@ -91,6 +91,13 @@ class AMX_MOE_BASE {
     if (config_.load && config_.path == "") {
       config_.load = false;
     }
+    if (config_.share_host_weights) {
+      if constexpr (!requires(typename T::BufferB& candidate, const void* weight, const void* scale) {
+                      candidate.set_external_readonly_data(weight, scale);
+                    }) {
+        throw std::runtime_error("selected AMX BufferB cannot attach shared host weights");
+      }
+    }
 
     MemoryRequest mem_requests;
     const size_t ml = config_.max_len;
@@ -121,14 +128,21 @@ class AMX_MOE_BASE {
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
       void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+          config_.share_host_weights
+              ? nullptr
+              : std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr =
+          config_.share_host_weights
+              ? nullptr
+              : std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
       void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+          config_.share_host_weights
+              ? nullptr
+              : std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp

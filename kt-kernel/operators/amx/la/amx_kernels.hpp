@@ -1523,13 +1523,13 @@ struct GemmKernel224Int4 {
     __m512i* db = reinterpret_cast<__m512i*>(local_buffer);
 
     for (size_t i = 0; i < TILE_N; i++) {
-      db[i] = _mm512_and_si512(hi_mask(), *static_cast<__m512i*>(offset_pointer(b, ldb * i)));
+      db[i] = _mm512_and_si512(hi_mask(), _mm512_loadu_si512(offset_pointer(b, ldb * i)));
     }
     asm volatile("" ::: "memory");
     _tile_loadd(2, db, TILE_K);
 
     for (size_t i = 0; i < TILE_N; i++) {
-      db[i] = _mm512_and_si512(hi_mask(), *static_cast<__m512i*>(offset_pointer(b, ldb * (i + TILE_N))));
+      db[i] = _mm512_and_si512(hi_mask(), _mm512_loadu_si512(offset_pointer(b, ldb * (i + TILE_N))));
     }
     asm volatile("" ::: "memory");
     _tile_loadd(3, db, TILE_K);
@@ -1546,14 +1546,14 @@ struct GemmKernel224Int4 {
     __m512i* db = reinterpret_cast<__m512i*>(local_buffer);
 
     for (size_t i = 0; i < TILE_N; i++) {
-      db[i] = _mm512_slli_epi32(_mm512_and_si512(lo_mask(), *static_cast<__m512i*>(offset_pointer(b, ldb * i))), 4);
+      db[i] = _mm512_slli_epi32(_mm512_and_si512(lo_mask(), _mm512_loadu_si512(offset_pointer(b, ldb * i))), 4);
     }
     asm volatile("" ::: "memory");
     _tile_loadd(2, db, TILE_K);
 
     for (size_t i = 0; i < TILE_N; i++) {
-      db[i] = _mm512_slli_epi32(
-          _mm512_and_si512(lo_mask(), *static_cast<__m512i*>(offset_pointer(b, ldb * (i + TILE_N)))), 4);
+      db[i] =
+          _mm512_slli_epi32(_mm512_and_si512(lo_mask(), _mm512_loadu_si512(offset_pointer(b, ldb * (i + TILE_N)))), 4);
     }
     asm volatile("" ::: "memory");
     _tile_loadd(3, db, TILE_K);
@@ -1634,15 +1634,17 @@ struct GemmKernel224Int4 {
     for (int k_begin = 0; k_begin < K::K_BLOCK && k_block_begin + k_begin < k; k_begin += K::BufferB::B_K_STEP) {
       int32_t* a32_lo = (int32_t*)ba->get_submat(m, k, m_begin, k_block_begin + k_begin);
       int32_t* a32_hi = (int32_t*)ba->get_submat(m, k, m_begin, k_block_begin + k_begin + K::K_STEP);
-      __m512i* b512 = (__m512i*)bb->get_submat(n, k, n_begin, k_block_begin + k_begin);
+      void* packed_weight = bb->get_submat(n, k, n_begin, k_block_begin + k_begin);
       for (int m_i = 0; m_i < m_block_end; m_i++) {
         for (int k_i = 0; k_i < 16; k_i++) {
           __m512i ma_lo = _mm512_set1_epi32(a32_lo[m_i * 16 + k_i]);
           __m512i ma_hi = _mm512_set1_epi32(a32_hi[m_i * 16 + k_i]);
           for (int n_i = 0; n_i < 2; n_i++) {
-            __m512i b512_lo = _mm512_slli_epi32(_mm512_and_si512(K::lo_mask(), b512[n_i * 16 + k_i]), 4);
+            const size_t packed_offset = static_cast<size_t>(n_i * 16 + k_i) * sizeof(__m512i);
+            const __m512i packed = _mm512_loadu_si512(offset_pointer(packed_weight, packed_offset));
+            __m512i b512_lo = _mm512_slli_epi32(_mm512_and_si512(K::lo_mask(), packed), 4);
             c512[m_i * 2 + n_i] = _mm512_dpbssd_epi32(c512[m_i * 2 + n_i], ma_lo, b512_lo);
-            __m512i b512_hi = _mm512_and_si512(K::hi_mask(), b512[n_i * 16 + k_i]);
+            __m512i b512_hi = _mm512_and_si512(K::hi_mask(), packed);
             c512[m_i * 2 + n_i] = _mm512_dpbssd_epi32(c512[m_i * 2 + n_i], ma_hi, b512_hi);
           }
         }
@@ -1700,7 +1702,7 @@ struct GemmKernel224Int4 {
     }
     for (int i = 0; i < to; i++) {
       __m512 as = _mm512_set1_ps(*ba->get_scale(m, m_begin + i));
-      __m512 bs = _mm512_load_ps(bb->get_scale(n, n_begin));
+      __m512 bs = _mm512_loadu_ps(bb->get_scale(n, n_begin));
       __m512i now = _mm512_load_epi32((__m512i*)(c + i * K::N_STEP));
       __m512 result = _mm512_mul_ps(_mm512_mul_ps(as, bs), _mm512_cvtepi32_ps(now));
       // if(i==0){
@@ -1715,7 +1717,7 @@ struct GemmKernel224Int4 {
       //   printf("\n");
       // }
       _mm512_store_ps((__m512*)(c + i * K::N_STEP), result);
-      bs = _mm512_load_ps(bb->get_scale(n, n_begin) + K::TILE_N);
+      bs = _mm512_loadu_ps(bb->get_scale(n, n_begin) + K::TILE_N);
       now = _mm512_load_si512((__m512i*)(c + i * K::N_STEP + K::TILE_N));
       result = _mm512_mul_ps(_mm512_mul_ps(as, bs), _mm512_cvtepi32_ps(now));
       // if(i==0){

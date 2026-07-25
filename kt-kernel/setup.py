@@ -815,6 +815,7 @@ setup(
     entry_points={
         "console_scripts": [
             "kt=kt_kernel.cli.main:main",
+            "kt-shared-host-weights=kt_kernel.utils.shared_host_weights:main",
         ],
     },
     ext_modules=[CMakeExtension("kt_kernel.kt_kernel_ext", str(REPO_ROOT))],

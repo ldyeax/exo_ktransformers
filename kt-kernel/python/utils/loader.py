@@ -9,11 +9,30 @@ This module provides loaders for:
 from __future__ import annotations
 
 import os
+from enum import IntEnum
+from pathlib import Path
+
 import numpy as np
 import torch
-from enum import IntEnum
-from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
+from safetensors import safe_open
+
+try:
+    from .shared_host_weights import (
+        ProtectedMapping,
+        SharedHostWeightError,
+        SharedHostWeightLease,
+        protect_file_mappings_read_only,
+    )
+except ImportError:  # CPU CI imports this module directly from python/utils.
+    if __package__:
+        raise
+    from shared_host_weights import (  # type: ignore[no-redef]
+        ProtectedMapping,
+        SharedHostWeightError,
+        SharedHostWeightLease,
+        protect_file_mappings_read_only,
+    )
 
 
 class GGMLQuantizationType(IntEnum):
@@ -292,6 +311,48 @@ class SafeTensorLoader:
     def has_tensor(self, name: str):
         return name in self.tensor_file_map
 
+
+class SharedSafeTensorLoader(SafeTensorLoader):
+    """Zero-copy, read-only safetensors loader backed by an exact lease.
+
+    Unlike :class:`SafeTensorLoader`, this loader never calls ``Tensor.to``.
+    All returned CPU tensors continue to reference the checkpoint's mmap.  The
+    mappings are protected read-only before any tensor address is handed to the
+    AMX kernel, so accidental writes fail instead of silently creating private
+    copy-on-write pages.
+    """
+
+    def __init__(self, file_path: str, lease: SharedHostWeightLease):
+        self.lease = lease
+        super().__init__(file_path)
+        root = Path(file_path)
+        folder = root.parent if root.is_file() else root
+        mapped_paths = tuple(sorted(folder.rglob("*.safetensors")))
+        if not mapped_paths:
+            raise SharedHostWeightError(f"no safetensors mappings found under {folder}")
+        lease.require_mapped_files(mapped_paths)
+        self.mapped_paths = mapped_paths
+        self.protected_mappings: tuple[ProtectedMapping, ...] = (
+            protect_file_mappings_read_only(mapped_paths)
+        )
+
+    def load_tensor(self, key: str, device: str = "cpu"):
+        if str(device) != "cpu":
+            raise SharedHostWeightError(
+                "shared host weights can only be attached directly on CPU"
+            )
+        if key not in self.tensor_file_map:
+            raise KeyError(f"Key {key} not found in Safetensor files")
+        file = self.tensor_file_map[key]
+        handle = self.file_handle_map.get(file)
+        if handle is None:
+            raise FileNotFoundError(f"File {file} not found in Safetensor files")
+        tensor = handle.get_tensor(key)
+        if tensor.device.type != "cpu" or not tensor.is_contiguous():
+            raise SharedHostWeightError(
+                f"shared host tensor is not contiguous CPU storage: {key}"
+            )
+        return tensor
 
 class FP8SafeTensorLoader(SafeTensorLoader):
     """Loader for FP8 expert weights with auto-detection of naming formats.
