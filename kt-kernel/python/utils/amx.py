@@ -666,6 +666,42 @@ class AMXMoEWrapper(BaseMoEWrapper):
             del self.up_scales
             del self.down_scales
 
+    def submit_write_weight_scale_to_buffer(
+        self,
+        gpu_tp_count: int,
+        expert_id: int,
+        w13_weight_ptrs,
+        w13_scale_ptrs,
+        w2_weight_ptrs,
+        w2_scale_ptrs,
+    ):
+        """Submit an AMXINT4 expert export to the shared CPUInfer queue."""
+        if self.moe is None:
+            raise RuntimeError(
+                "MoE instance not initialized; cannot submit "
+                "write_weight_scale_to_buffer task."
+            )
+        if not hasattr(self.moe, "write_weight_scale_to_buffer_task"):
+            raise NotImplementedError(
+                "write_weight_scale_to_buffer_task is not available for this "
+                "backend implementation."
+            )
+
+        self.cpu_infer.submit(
+            self.moe.write_weight_scale_to_buffer_task(
+                gpu_tp_count,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+        )
+
+    def sync_write_weight_scale_to_buffer(self):
+        """Wait for previously submitted AMXINT4 expert exports."""
+        self.cpu_infer.sync()
+
 
 class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for RAWINT4/FP8/FP8_PERCHANNEL/BF16 experts stored in compressed SafeTensor format."""
