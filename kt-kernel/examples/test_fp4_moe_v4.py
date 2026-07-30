@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from typing import Tuple
@@ -32,8 +33,8 @@ E2M1_VALUES = torch.tensor(
 )
 
 
-def dequantize_mxfp4(weight_u8: torch.Tensor, scale_bf16: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Decode a [N, K/2] uint8 tensor of nibble-packed E2M1 with [N, K/gs] bf16
+def dequantize_mxfp4(weight_u8: torch.Tensor, scale_ue8m0: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Decode a [N, K/2] uint8 tensor of nibble-packed E2M1 with [N, K/gs] UE8M0
     scales into a [N, K] bf16 weight tensor.
 
     Layout (matches kernel's mxfp4_to_bf16_32): byte `b` low nibble = element K=2b,
@@ -42,14 +43,15 @@ def dequantize_mxfp4(weight_u8: torch.Tensor, scale_bf16: torch.Tensor, group_si
     n, k_packed = weight_u8.shape
     k = k_packed * 2
     assert k % group_size == 0, f"K={k} must be divisible by group_size={group_size}"
-    assert scale_bf16.shape == (n, k // group_size)
+    assert scale_ue8m0.dtype == torch.uint8
+    assert scale_ue8m0.shape == (n, k // group_size)
 
     lo = (weight_u8 & 0x0F).to(torch.long)
     hi = ((weight_u8 >> 4) & 0x0F).to(torch.long)
     nibbles = torch.stack([lo, hi], dim=-1).view(n, k)  # interleave back to K order
     decoded = E2M1_VALUES.to(weight_u8.device)[nibbles]  # [N, K] fp32
 
-    scale_fp32 = scale_bf16.to(torch.float32)
+    scale_fp32 = (scale_ue8m0.to(torch.int32) << 23).view(torch.float32)
     scale_full = scale_fp32.repeat_interleave(group_size, dim=-1)  # [N, K]
     return (decoded * scale_full).to(torch.bfloat16).contiguous()
 
@@ -170,6 +172,8 @@ def main() -> int:
     print(f"[V4-MXFP4] rel mean diff = {rel.item()*100:.3f}%")
     print(f"[V4-MXFP4] amx[:8]  = {y_amx.flatten()[:8]}")
     print(f"[V4-MXFP4] ref[:8]  = {y_ref.flatten()[:8]}")
+    output_bytes = y_amx.contiguous().view(torch.uint8).numpy().tobytes()
+    print(f"[V4-MXFP4] output sha256 = {hashlib.sha256(output_bytes).hexdigest()}")
 
     return 0 if rel.item() < 0.10 else 1
 

@@ -1660,6 +1660,13 @@ struct BufferCReduceImpl {
   static constexpr int N_STEP = K::N_STEP;
   static constexpr int N_BLOCK = K::N_BLOCK;
 
+  static int n_block_size(int n) {
+    if constexpr (requires { K::n_block_size(n); }) {
+      return K::n_block_size(n);
+    }
+    return N_BLOCK;
+  }
+
   static size_t required_size(int max_m, int n) {
     // Need space for both float* c and int32_t* int_c
     return sizeof(float) * max_m * n + sizeof(int32_t) * max_m * n;
@@ -1703,16 +1710,18 @@ struct BufferCReduceImpl {
 
   float* get_submat(int m, int n, int m_begin, int n_begin) {
     int m_block_size = (m + M_STEP - 1) / M_STEP * M_STEP;
-    int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
-    int n_block_size = std::min(N_BLOCK, n - n_block_begin);
+    const int block_size = n_block_size(n);
+    int n_block_begin = n_begin / block_size * block_size;
+    int n_block_size = std::min(block_size, n - n_block_begin);
     n_begin -= n_block_begin;
     return c + m_block_size * n_block_begin + m_begin * n_block_size + n_begin * M_STEP;
   }
 
   int32_t* get_int_submat(int m, int n, int m_begin, int n_begin) {
     int m_block_size = (m + M_STEP - 1) / M_STEP * M_STEP;
-    int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
-    int n_block_size = std::min(N_BLOCK, n - n_block_begin);
+    const int block_size = n_block_size(n);
+    int n_block_begin = n_begin / block_size * block_size;
+    int n_block_size = std::min(block_size, n - n_block_begin);
     n_begin -= n_block_begin;
     return int_c + m_block_size * n_block_begin + m_begin * n_block_size + n_begin * M_STEP;
   }

@@ -1207,9 +1207,9 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
       {base}.ffn.experts.{i}.w2.{weight,scale}              down
 
     V4 ckpt keys are not prefixed with ``model.``; we also probe the stripped form so
-    callers can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
-    bit shift (both have an 8-bit exponent and zero mantissa for ue8m0), and the AMX
-    FP4 backend already consumes bf16 scales.
+    callers can keep passing ``base_key="model.layers.{L}"``. Scales remain in their
+    native one-byte UE8M0 representation. The MXFP4 kernel reconstructs the FP32
+    exponent at use time, avoiding three expanded scale copies across a full model.
     """
 
     EXPERTS_PATH_TPL = "{base}.ffn.experts"
@@ -1222,15 +1222,10 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         return list(dict.fromkeys(candidates))
 
     @staticmethod
-    def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+    def _native_ue8m0(scale_t: torch.Tensor) -> torch.Tensor:
         if scale_t.dtype != torch.uint8:
             scale_t = scale_t.view(torch.uint8)
-        # bf16 = [sign(1) | exp(8) | mant(7)]; setting mant=0, exp=e gives 2^(e-127),
-        # which is exactly the value encoded by ue8m0 for e ∈ [1, 254]. e=0 → bf16 +0
-        # (acceptable: ue8m0=0 represents 2^-127, below bf16 normal range), e=255 → +inf.
-        # Compute in int32 then narrow to int16 (max value is 255<<7=32640, fits int16),
-        # because torch CPU has no lshift kernel for uint16.
-        return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+        return scale_t.contiguous()
 
     def load_experts(self, base_key: str, device: str = "cpu"):
         gate_name, up_name, down_name = self.PROJ_NAMES
@@ -1272,7 +1267,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (down_name, down_scales),
             ):
                 s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
-                dst[exp_id] = self._ue8m0_to_bf16(s)
+                dst[exp_id] = self._native_ue8m0(s)
 
         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
         return {

@@ -18,11 +18,36 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "hwloc.h"
 
 thread_local int WorkerPool::thread_local_id = -1;
+
+namespace {
+
+std::chrono::microseconds worker_spin_duration() {
+  static const std::chrono::microseconds duration = [] {
+    constexpr long long default_spin_us = 50000;
+    const char* value = std::getenv("KT_WORKER_SPIN_US");
+    if (value == nullptr) {
+      return std::chrono::microseconds(default_spin_us);
+    }
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0) {
+      std::fprintf(stderr,
+                   "Ignoring invalid KT_WORKER_SPIN_US=%s; using %lld us\n",
+                   value, default_spin_us);
+      return std::chrono::microseconds(default_spin_us);
+    }
+    return std::chrono::microseconds(parsed);
+  }();
+  return duration;
+}
+
+}  // namespace
 
 InNumaPool::InNumaPool(int max_thread_num) {
   printf("In Numa Worker Pool at NUMA %d, %d threads\n", numa_node_of_cpu(sched_getcpu()), max_thread_num);
@@ -77,9 +102,10 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
+    const int core_index = i + threads_id_start;
+    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, core_index);
     if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
+      fprintf(stderr, "Core %d inside NUMA node %d not found\n", core_index, numa_id);
       // throw std::runtime_error("Core not found inside NUMA node");
       continue;
     }
@@ -214,6 +240,7 @@ void InNumaPool::worker_thread(int thread_id, int numa_id) {
     set_memory_to_numa(numa_id);
   }
   auto start = std::chrono::high_resolution_clock::now();
+  const auto spin_duration = worker_spin_duration();
   WorkerPool::thread_local_id = thread_id;  // 设置线程本地变量
   while (true) {
     ThreadStatus status = thread_state_[thread_id].status.load(std::memory_order_acquire);
@@ -221,9 +248,10 @@ void InNumaPool::worker_thread(int thread_id, int numa_id) {
       process_tasks(thread_id);
       start = std::chrono::high_resolution_clock::now();
     } else if (status == ThreadStatus::WAITING) {
-      auto now = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (duration > 50) {
+      const bool should_sleep =
+          spin_duration.count() == 0 ||
+          std::chrono::high_resolution_clock::now() - start >= spin_duration;
+      if (should_sleep) {
         std::unique_lock<std::mutex> lock(thread_state_[thread_id].mutex);
         thread_state_[thread_id].cv.wait(lock, [&] {
           return thread_state_[thread_id].status.load(std::memory_order_acquire) != ThreadStatus::WAITING;
@@ -282,10 +310,19 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
   }
 
   workers.resize(numa_count);
-  std::vector<int> numa_threads_count(numa_count, 0);
+  // numa_ids contains physical NUMA IDs, which need not be dense within the
+  // selected subpool list.  In particular, a one-subpool configuration for
+  // physical node 1 has numa_count == 1 but still indexes ID 1.
+  // Indexing a numa_count-sized vector here read past the end and produced a
+  // bogus start_id (observed as 32768), silently defeating strict core
+  // affinity for nearly every worker.
+  std::vector<int> numa_threads_count(numa_num_configured_nodes(), 0);
   for (int i = 0; i < numa_count; i++) {
-    workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
     auto this_numa = numa_ids[i];
+    if (this_numa < 0 || this_numa >= static_cast<int>(numa_threads_count.size())) {
+      throw std::invalid_argument("NUMA ID outside configured node range");
+    }
+    workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
     auto start_id = numa_threads_count[this_numa];
     // set the thread name as: "worker_numa_(numa_id)_main_start_id(0)"
     // printf("nuam_id %d, start_id %d\n", this_numa, start_id);
@@ -384,6 +421,7 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
 
 void NumaJobDistributor::worker_thread(int numa_id) {
   auto start = std::chrono::high_resolution_clock::now();
+  const auto spin_duration = worker_spin_duration();
   set_memory_to_numa(numa_id);
   status[numa_id] =
       std::move(std::unique_ptr<std::atomic<ThreadStatus>>(new std::atomic<ThreadStatus>(ThreadStatus::WAITING)));
@@ -397,9 +435,10 @@ void NumaJobDistributor::worker_thread(int numa_id) {
       status[numa_id]->store(ThreadStatus::WAITING, std::memory_order_release);
       start = std::chrono::high_resolution_clock::now();
     } else if (stat == ThreadStatus::WAITING) {
-      auto now = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-      if (duration > 50) {
+      const bool should_sleep =
+          spin_duration.count() == 0 ||
+          std::chrono::high_resolution_clock::now() - start >= spin_duration;
+      if (should_sleep) {
         std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
         cvs[numa_id]->wait(lock, [&] {
           return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;
@@ -421,9 +460,15 @@ void WorkerPool::init(WorkerPoolConfig config) {
   for (int i = 0; i < config.subpool_count; i++) {
     numa_worker_pools.push_back(nullptr);
   }
-  std::vector<int> numa_threads_count(config.subpool_count, 0);
+  // subpool_numa_map stores physical NUMA IDs.  Size this accounting table
+  // by the machine topology rather than the number of selected subpools so
+  // an explicit single-node-1 pool cannot index out of bounds.
+  std::vector<int> numa_threads_count(numa_num_configured_nodes(), 0);
   for (int i = 0; i < config.subpool_count; i++) {
     auto this_numa = config.subpool_numa_map[i];
+    if (this_numa < 0 || this_numa >= static_cast<int>(numa_threads_count.size())) {
+      throw std::invalid_argument("NUMA ID outside configured node range");
+    }
     auto this_thread_count = config.subpool_thread_count[i];
     auto this_thread_id_start = numa_threads_count[this_numa];
     std::thread([this, i, this_numa, this_thread_count, this_thread_id_start]() {

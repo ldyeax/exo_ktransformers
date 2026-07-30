@@ -882,7 +882,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.loader = NativeMoEWrapper._native_loader_instance
 
         t0 = time.time()
+        explicit_weight_key_prefix = getattr(self, "weight_key_prefix", None)
         _candidates = [
+            *(
+                [explicit_weight_key_prefix]
+                if isinstance(explicit_weight_key_prefix, str)
+                and explicit_weight_key_prefix
+                else []
+            ),
             f"model.layers.{self.layer_idx}",
             f"language_model.model.layers.{self.layer_idx}",
             f"model.language_model.layers.{self.layer_idx}",
@@ -899,6 +906,53 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}"
             )
         t1 = time.time()
+
+        weight_expert_ids = getattr(self, "weight_expert_ids", None)
+        if weight_expert_ids is not None:
+            if not isinstance(weight_expert_ids, torch.Tensor):
+                raise TypeError("weight_expert_ids must be a torch.Tensor")
+            expert_ids = weight_expert_ids.to(
+                device="cpu", dtype=torch.int64
+            ).tolist()
+            if len(expert_ids) != self.num_experts:
+                raise ValueError(
+                    "NativeMoEWrapper shard size does not match num_experts: "
+                    f"ids={len(expert_ids)} num_experts={self.num_experts}"
+                )
+            source_expert_count = len(weights["gate"])
+            if len(set(expert_ids)) != len(expert_ids) or any(
+                expert_id < 0 or expert_id >= source_expert_count
+                for expert_id in expert_ids
+            ):
+                raise ValueError(
+                    "NativeMoEWrapper weight_expert_ids must be unique and in "
+                    f"[0, {source_expert_count})"
+                )
+            for tensor_group in (
+                "gate",
+                "up",
+                "down",
+                "gate_scale",
+                "up_scale",
+                "down_scale",
+            ):
+                if tensor_group in weights:
+                    weights[tensor_group] = [
+                        weights[tensor_group][expert_id]
+                        for expert_id in expert_ids
+                    ]
+            # Pointer tables are now in local physical order, so the native
+            # kernel can retain its dense local indexing without expanding
+            # storage to the largest global expert id.
+            physical_to_logical_map_cpu = torch.arange(
+                self.num_experts, dtype=torch.int64, device="cpu"
+            )
+            logger.info(
+                "[KT] Native expert shard layer=%d local=%d source=%d",
+                self.layer_idx,
+                self.num_experts,
+                source_expert_count,
+            )
 
         # Keep individual tensors instead of stacking - avoid expensive memory copy
         # weights["gate"], weights["up"], weights["down"] are lists of tensors per expert
@@ -935,9 +989,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
-                # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
-                # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                assert self.gate_scales[0].dtype == torch.uint8, (
+                    "Expected native UE8M0 byte scales for MXFP4"
+                )
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"

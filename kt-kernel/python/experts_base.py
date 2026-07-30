@@ -97,34 +97,42 @@ class KExpertsCPUBuffer:
         if batch_size == cls.temp_bs:
             return cls.temp_buffer
 
-        input_tensor_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
-            for _ in range(cls.buffer_depth)
-        ]
-        immediate_experts_ids_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        deferred_experts_ids_cpu = [
-            torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        weights_cpu = [
-            torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        output_cpu = [
-            torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
-            for _ in range(cls.buffer_depth)
-        ]
-        bsz_tensor_cpu = [
-            torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=pin_memory)
-            for _ in range(cls.buffer_depth)
-        ]
-        output_gpu = [
-            torch.zeros((batch_size, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
-            for _ in range(cls.buffer_depth)
-        ]
+        # A new ragged-verify size can first reach this allocator while the
+        # model runner is inside torch.inference_mode().  Such tensors cannot
+        # later be updated by a breakable-CUDA-graph host callback running
+        # outside inference mode.  The staging ring is deliberately mutable
+        # and outlives either context, so always allocate ordinary tensors.
+        with torch.inference_mode(False):
+            input_tensor_cpu = [
+                torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+                for _ in range(cls.buffer_depth)
+            ]
+            immediate_experts_ids_cpu = [
+                torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
+                for _ in range(cls.buffer_depth)
+            ]
+            deferred_experts_ids_cpu = [
+                torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
+                for _ in range(cls.buffer_depth)
+            ]
+            weights_cpu = [
+                torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
+                for _ in range(cls.buffer_depth)
+            ]
+            output_cpu = [
+                torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+                for _ in range(cls.buffer_depth)
+            ]
+            bsz_tensor_cpu = [
+                torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=pin_memory)
+                for _ in range(cls.buffer_depth)
+            ]
+            # Allocate device outputs lazily in sync_forward. SGLang supplies
+            # its now-dead shared input staging tensor as the copy-out target,
+            # avoiding two persistent [chunk, hidden] GPU ring slots.
+            output_gpu: List[Optional[torch.Tensor]] = [
+                None for _ in range(cls.buffer_depth)
+            ]
 
         cur_buffer = (
             input_tensor_cpu,
@@ -279,14 +287,29 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
 
+        # A CPU-only expert sidecar never copies this mask to a GPU.  Allow it
+        # to run with CUDA hidden so the sidecar does not consume a CUDA
+        # context on the serving GPU.
+        pin_expert_mask = os.environ.get("KT_CPU_ONLY_SIDECAR") != "1"
+
         # Process gpu_experts_mask: convert to bool tensor on CPU, pinned memory for async copy
         # This mask is shared between C and Python (C uses uint8_t*), both can read/write it
         if gpu_experts_mask is None:
             # No GPU experts - all experts on CPU
-            self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu", pin_memory=True)
+            self.gpu_experts_mask = torch.zeros(
+                num_experts,
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=pin_expert_mask,
+            )
         else:
             # Create a new pinned tensor and copy data into it
-            self.gpu_experts_mask = torch.empty(num_experts, dtype=torch.bool, device="cpu", pin_memory=True)
+            self.gpu_experts_mask = torch.empty(
+                num_experts,
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=pin_expert_mask,
+            )
             self.gpu_experts_mask.copy_(gpu_experts_mask)
 
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
@@ -454,7 +477,12 @@ class BaseMoEWrapper(_MoEBase, ABC):
             )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
-    def sync_forward(self, hidden_states: torch.Tensor, cuda_stream) -> torch.Tensor:
+    def sync_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cuda_stream,
+        output_tensor: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Synchronize and retrieve forward inference results.
 
@@ -463,7 +491,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
             cuda_stream: CUDA stream for synchronization
 
         Returns:
-            output_gpu: Output tensor on GPU
+            output_gpu: Output tensor on GPU. If output_tensor is supplied,
+                its storage is reused after the CPU task has consumed the
+                staged input.
         """
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         (
@@ -479,8 +509,27 @@ class BaseMoEWrapper(_MoEBase, ABC):
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
-        output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
-        return output_gpu[current_slot]
+        if output_tensor is None:
+            current_output = output_gpu[current_slot]
+            if (
+                current_output is None
+                or current_output.shape != flat_hidden_states.shape
+                or current_output.dtype != flat_hidden_states.dtype
+                or current_output.device != flat_hidden_states.device
+            ):
+                current_output = torch.empty_like(flat_hidden_states)
+                output_gpu[current_slot] = current_output
+        else:
+            current_output = output_tensor.view_as(flat_hidden_states)
+            if (
+                current_output.dtype != flat_hidden_states.dtype
+                or current_output.device != flat_hidden_states.device
+            ):
+                raise ValueError(
+                    "KExperts CPU output reuse requires matching dtype and device"
+                )
+        current_output.copy_(output_cpu[current_slot], non_blocking=True)
+        return current_output
 
     def forward(
         self,
@@ -541,4 +590,3 @@ class BaseMoEWrapper(_MoEBase, ABC):
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
-

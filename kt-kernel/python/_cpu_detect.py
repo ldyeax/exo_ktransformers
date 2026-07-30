@@ -185,7 +185,7 @@ def load_extension(variant):
         ImportError: If all variants fail to load
     """
     import importlib.util
-    import glob
+    from importlib.machinery import EXTENSION_SUFFIXES
 
     # The .so files can be named in two ways:
     # Multi-variant: _kt_kernel_ext_amx.cpython-311-x86_64-linux-gnu.so
@@ -197,14 +197,20 @@ def load_extension(variant):
         # We can't import kt_kernel here (circular import), so use __file__
         kt_kernel_dir = os.path.dirname(os.path.abspath(__file__))
 
-        # Try multi-variant naming first
-        pattern = os.path.join(kt_kernel_dir, f"_kt_kernel_ext_{variant}.*.so")
-        so_files = glob.glob(pattern)
+        def exact_extension_candidates(stem: str) -> list[str]:
+            return [
+                os.path.join(kt_kernel_dir, stem + suffix)
+                for suffix in EXTENSION_SUFFIXES
+                if os.path.isfile(os.path.join(kt_kernel_dir, stem + suffix))
+            ]
 
+        # Match only an exact Python extension ABI suffix. A broad `*.so`
+        # glob can silently select backup/debug artifacts that happen to share
+        # the stem, making the loaded native kernel depend on directory order.
+        so_files = exact_extension_candidates(f"_kt_kernel_ext_{variant}")
         if not so_files:
             # Try single-variant naming (fallback for builds without CPUINFER_BUILD_ALL_VARIANTS)
-            pattern = os.path.join(kt_kernel_dir, "kt_kernel_ext.*.so")
-            so_files = glob.glob(pattern)
+            so_files = exact_extension_candidates("kt_kernel_ext")
 
             if so_files:
                 if os.environ.get("KT_KERNEL_DEBUG") == "1":
