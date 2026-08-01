@@ -10,5 +10,5 @@
 	branch = fix-precision-mla-merge-main
 [submodule "third_party/sglang"]
 	path = third_party/sglang
-	url = /var/lib/exo/sources/sglang-glm52-osdi26-patched.git
+	url = https://github.com/ldyeax/exo_sglang.git
 	branch = bundle/glm52-fwuff-sglang
