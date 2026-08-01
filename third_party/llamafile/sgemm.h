@@ -11,7 +11,23 @@ extern "C" {
 #endif
 
 struct ggml_tensor;
-struct ggml_compute_params;
+
+// llamafile 0.8.8 used ggml's former task-phase API.  Keep the small ABI
+// locally now that current ggml no longer exposes ggml_compute_params or
+// ggml_task_type in its public/internal compatibility headers.
+enum ggml_task_type {
+    GGML_TASK_TYPE_INIT = 0,
+    GGML_TASK_TYPE_COMPUTE = 1,
+    GGML_TASK_TYPE_FINALIZE = 2,
+};
+
+struct ggml_compute_params {
+    enum ggml_task_type type;
+    int ith;
+    int nth;
+    size_t wsize;
+    void* wdata;
+};
 #ifdef __aarch64__
 
 bool iqk_mul_mat(long, long, long, int, const void*, const void*, float*, long, int, int);

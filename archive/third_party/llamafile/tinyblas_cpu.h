@@ -47,8 +47,12 @@
 
 #pragma once
 
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 // #include "log.h"
 #include "flags.h"
 #include "sgemm.h"

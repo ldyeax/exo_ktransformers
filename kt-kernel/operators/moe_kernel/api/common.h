@@ -2,7 +2,7 @@
 #pragma once
 #include <cstdint>
 
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/include/ggml.h"
 #if !defined(CPUINFER_HAS_FLOAT16_T)
 using float16_t = ggml_fp16_t;
 #define CPUINFER_HAS_FLOAT16_T 1

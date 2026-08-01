@@ -1,6 +1,7 @@
 [submodule "third_party/llama.cpp"]
 	path = archive/third_party/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp.git
+	url = https://github.com/ldyeax/exo_llama_cpp.git
+	branch = exo/kimi-k3-cumulative
 [submodule "third_party/pybind11"]
 	path = archive/third_party/pybind11
 	url = https://github.com/pybind/pybind11.git
@@ -22,7 +23,8 @@
 	url = https://github.com/alibaba/PhotonLibOS.git
 [submodule "kt-kernel/third_party/llama.cpp"]
 	path = kt-kernel/third_party/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp.git
+	url = https://github.com/ldyeax/exo_llama_cpp.git
+	branch = exo/kimi-k3-cumulative
 [submodule "kt-kernel/third_party/pybind11"]
 	path = kt-kernel/third_party/pybind11
 	url = https://github.com/pybind/pybind11.git

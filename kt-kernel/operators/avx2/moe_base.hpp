@@ -33,7 +33,7 @@
 #include "../moe-tp.hpp"
 #include "avx2_bf16_gemm.hpp"
 #include "avx2_bf16_utils.hpp"
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/include/ggml.h"
 
 template <class T, class Derived>
 class AVX2_MOE_BASE {

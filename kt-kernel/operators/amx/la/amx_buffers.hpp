@@ -10,7 +10,7 @@
 
 #include "amx_config.hpp"
 #include "amx_utils.hpp"
-#include "llama.cpp/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
 #include "pack.hpp"
 #include "utils.hpp"
 

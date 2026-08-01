@@ -36,7 +36,7 @@
 #include "../common.hpp"
 #include "../moe-tp.hpp"
 #include "la/amx.hpp"
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/include/ggml.h"
 
 template <class T, class Derived>
 class AMX_MOE_BASE {

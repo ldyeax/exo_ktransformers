@@ -12,6 +12,7 @@
 #include <cmath>
 
 #include "ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-cpu/quants.h"
 #include "kvcache.h"
 #include "llamafile/sgemm.h"
 

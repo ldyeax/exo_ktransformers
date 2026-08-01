@@ -128,7 +128,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Use header-only fmt to avoid needing to link libfmt (fix undefined symbol vprint)
 add_compile_definitions(FMT_HEADER_ONLY)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -fno-finite-math-only")
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -fsanitize=address -fno-omit-frame-pointer")
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -417,7 +417,11 @@ add_compile_options("$<$<COMPILE_LANGUAGE:C>:${ARCH_FLAGS}>")
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/third_party/pybind11)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp ${CMAKE_CURRENT_BINARY_DIR}/third_party/llama.cpp)
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp/ggml/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp/ggml/src
+)
 if(KTRANSFORMERS_USE_CUDA)
     include(CheckLanguage)
     check_language(CUDA)

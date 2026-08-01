@@ -8,7 +8,7 @@
 #include <cstdio>
 
 #include "../../../cpu_backend/worker_pool.h"
-#include "llama.cpp/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
 #include "utils.hpp"
 
 namespace avx {

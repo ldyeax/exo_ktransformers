@@ -10,8 +10,8 @@
 #include "../../rope.hpp"
 #include "../../softmax.hpp"
 #include "../la/arm_kml.hpp"
-#include "llama.cpp/ggml-common.h"
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/src/ggml-common.h"
+#include "llama.cpp/ggml/include/ggml.h"
 
 void bf16_to_fp16(const ggml_bf16_t* src, ggml_fp16_t* dst, size_t n) {
   for (size_t i = 0; i < n; ++i) {

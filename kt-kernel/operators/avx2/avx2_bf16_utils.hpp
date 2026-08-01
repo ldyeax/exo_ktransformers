@@ -13,7 +13,7 @@
 
 #include <immintrin.h>
 #include <cmath>
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/include/ggml.h"
 
 namespace avx2 {
 

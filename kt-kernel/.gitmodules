@@ -3,4 +3,5 @@
 	url = https://github.com/pybind/pybind11.git
 [submodule "llama.cpp"]
 	path = third_party/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp.git
+	url = https://github.com/ldyeax/exo_llama_cpp.git
+	branch = exo/kimi-k3-cumulative

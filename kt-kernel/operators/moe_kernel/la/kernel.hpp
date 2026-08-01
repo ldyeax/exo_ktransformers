@@ -14,7 +14,7 @@
 
 #include "../api/common.h"
 #include "../mat_kernel/batch_gemm_api.hpp"
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/include/ggml.h"
 static const size_t MAX_Nth_B = 1024, MAX_N_B = 1024, MAX_K_B = 10240;
 namespace moe_kernel {
 template <typename T>

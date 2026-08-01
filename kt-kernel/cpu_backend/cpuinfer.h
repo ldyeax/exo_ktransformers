@@ -29,7 +29,8 @@
 #endif
 
 #include "./vendors/vendor.h"
-#include "llama.cpp/ggml-impl.h"
+#include "llama.cpp/ggml/include/ggml-cpu.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
 #include "task_queue.h"
 #include "worker_pool.h"
 
@@ -39,26 +40,20 @@ class CPUInfer {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num);
     task_queue_ = new TaskQueue();
-    for (int i = 0; i < (1 << 16); ++i) {
-      ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
-    }
+    ggml_cpu_init();
   }
   CPUInfer(int thread_num, int numa_id) {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(thread_num, numa_id);
     task_queue_ = new TaskQueue();
-    for (int i = 0; i < (1 << 16); ++i) {
-      ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
-    }
+    ggml_cpu_init();
   }
 
   CPUInfer(WorkerPoolConfig config) {
     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
     backend_ = new WorkerPool(config);
     task_queue_ = new TaskQueue();
-    for (int i = 0; i < (1 << 16); ++i) {
-      ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
-    }
+    ggml_cpu_init();
   }
 
   ~CPUInfer() {

@@ -10,8 +10,8 @@
 #include "amx_config.hpp"
 #include "amx_quantization.hpp"
 #include "amx_utils.hpp"
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 #include "llamafile/sgemm.h"
 #include "utils.hpp"
 

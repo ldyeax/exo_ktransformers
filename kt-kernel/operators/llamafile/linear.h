@@ -19,9 +19,9 @@
 #include "../../cpu_backend/shared_mem_buffer.h"
 #include "../../cpu_backend/worker_pool.h"
 #include "conversion.h"
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
+#include "llama.cpp/ggml/include/ggml.h"
 #include "llamafile/sgemm.h"
 
 struct LinearConfig {

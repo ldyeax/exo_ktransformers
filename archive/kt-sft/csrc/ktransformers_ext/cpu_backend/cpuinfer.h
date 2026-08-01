@@ -31,7 +31,7 @@
  #include "task_queue.h"
  #include "./vendors/vendor.h"
  
- #include "llama.cpp/ggml-impl.h"
+ #include "llama.cpp/ggml/src/ggml-impl.h"
  
  class CPUInfer {
     public:

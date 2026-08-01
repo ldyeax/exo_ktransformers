@@ -2,8 +2,8 @@
 #include <stdexcept>
 
 #include "amx.hpp"
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 
 int main() {
   // init GGML

@@ -4,8 +4,8 @@
 #include <cmath>
 
 #include "amx_config.hpp"
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 #include "utils.hpp"
 
 namespace amx {

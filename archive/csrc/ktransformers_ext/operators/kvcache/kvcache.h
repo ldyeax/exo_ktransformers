@@ -31,10 +31,10 @@
 #include <vector>
 
 #include "../../cpu_backend/backend.h"
-#include "llama.cpp/ggml-common.h"
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
-#include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml/src/ggml-common.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
+#include "llama.cpp/ggml/include/ggml.h"
 #include "llamafile/sgemm.h"
 
 #define CHUNK_SIZE 32

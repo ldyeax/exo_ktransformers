@@ -8,8 +8,8 @@
 
 #include "../../common.hpp"
 #include "../la/utils.hpp"
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 #include "timer.hh"
 
 template <typename T>

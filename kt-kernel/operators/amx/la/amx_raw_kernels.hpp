@@ -10,7 +10,7 @@
 #include "amx_config.hpp"
 #include "amx_raw_buffers.hpp"
 #include "amx_utils.hpp"
-#include "llama.cpp/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
 
 namespace amx {
 

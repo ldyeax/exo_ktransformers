@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <stdexcept>
 
-#include "llama.cpp/ggml-quants.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 
 // Include the split AMX headers
 #include "amx_config.hpp"

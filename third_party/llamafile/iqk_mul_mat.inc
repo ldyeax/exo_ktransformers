@@ -22,10 +22,13 @@
 
 #include <cstring>
 #include <type_traits>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #if defined __x86_64__ || defined __aarch64__ || defined(_M_X64)
 
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "llama.cpp/ggml/src/ggml-impl.h"
+#include "llama.cpp/ggml/src/ggml-quants.h"
 #include "sgemm.h"
 
 // For i-quants, I had to explicitely specify which
@@ -43,7 +46,7 @@
 #endif
 
 #define GGML_COMMON_IMPL_C
-#include "llama.cpp/ggml-common.h"
+#include "llama.cpp/ggml/src/ggml-common.h"
 
 // clang-format off
 
