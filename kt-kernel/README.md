@@ -612,7 +612,7 @@ wrapper = KTMoEWrapper(
     chunked_prefill_size=512,
     method="AMXINT4",
     cpu_save=False,  # Keep weights in CPU memory after loading
-    max_deferred_experts_per_token=0  # Number of experts to defer (for pipelined execution)
+    max_deferred_experts_per_token=0  # Lower-scored experts to run as an exact same-layer tail task
 )
 
 # Pre-allocate buffers for specific batch sizes (improves performance)

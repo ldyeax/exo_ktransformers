@@ -9,12 +9,11 @@ This module contains base classes and utilities shared across all backend implem
 
 from __future__ import annotations
 
-import torch
-from typing import Dict, List, Optional, Tuple
-from abc import ABC, abstractmethod
 import os
-import ctypes
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Tuple
 
+import torch
 from kt_kernel import kt_kernel_ext
 
 
@@ -56,11 +55,15 @@ def generate_gpu_experts_masks(
     num_gpu_experts = max(num_gpu_experts, 0)
 
     if num_gpu_experts == 0:
-        return torch.zeros(num_layers, num_experts_per_layer, dtype=torch.bool, device="cpu")
+        return torch.zeros(
+            num_layers, num_experts_per_layer, dtype=torch.bool, device="cpu"
+        )
 
     # Flatten and find top-k indices
     flat_freq = activation_freq.view(-1).to(device="cpu")
-    _, top_indices = torch.topk(flat_freq, k=num_gpu_experts, largest=True, sorted=False)
+    _, top_indices = torch.topk(
+        flat_freq, k=num_gpu_experts, largest=True, sorted=False
+    )
 
     # Create mask
     gpu_experts_masks = torch.zeros(total_experts, dtype=torch.bool, device="cpu")
@@ -104,27 +107,59 @@ class KExpertsCPUBuffer:
         # and outlives either context, so always allocate ordinary tensors.
         with torch.inference_mode(False):
             input_tensor_cpu = [
-                torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+                torch.zeros(
+                    (batch_size, hidden_size),
+                    device="cpu",
+                    pin_memory=pin_memory,
+                    dtype=torch.bfloat16,
+                )
                 for _ in range(cls.buffer_depth)
             ]
             immediate_experts_ids_cpu = [
-                torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=pin_memory)
+                torch.zeros(
+                    (batch_size, num_experts_per_tok),
+                    device="cpu",
+                    dtype=torch.long,
+                    pin_memory=pin_memory,
+                )
                 for _ in range(cls.buffer_depth)
             ]
             deferred_experts_ids_cpu = [
-                torch.full((batch_size, num_experts_per_tok), -1, device="cpu", dtype=torch.long, pin_memory=pin_memory)
+                torch.full(
+                    (batch_size, num_experts_per_tok),
+                    -1,
+                    device="cpu",
+                    dtype=torch.long,
+                    pin_memory=pin_memory,
+                )
                 for _ in range(cls.buffer_depth)
             ]
             weights_cpu = [
-                torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory)
+                torch.zeros(
+                    (batch_size, num_experts_per_tok),
+                    device="cpu",
+                    dtype=torch.float32,
+                    pin_memory=pin_memory,
+                )
                 for _ in range(cls.buffer_depth)
             ]
             output_cpu = [
-                torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
+                torch.zeros(
+                    (batch_size, hidden_size),
+                    device="cpu",
+                    pin_memory=pin_memory,
+                    dtype=torch.bfloat16,
+                )
                 for _ in range(cls.buffer_depth)
             ]
             bsz_tensor_cpu = [
-                torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=pin_memory)
+                torch.full(
+                    (1,),
+                    batch_size,
+                    device="cpu",
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
+                )
                 for _ in range(cls.buffer_depth)
             ]
             # Allocate device outputs lazily in sync_forward. SGLang supplies
@@ -194,7 +229,8 @@ class _MoEBase:
             else:
                 subpool_numa_map = list(range(threadpool_count))
             subpool_thread_count = [
-                cpuinfer_threads // threadpool_count + (1 if i < cpuinfer_threads % threadpool_count else 0)
+                cpuinfer_threads // threadpool_count
+                + (1 if i < cpuinfer_threads % threadpool_count else 0)
                 for i in range(threadpool_count)
             ]
 
@@ -223,12 +259,17 @@ class _MoEBase:
         if hidden_size <= 0:
             raise ValueError(f"hidden_size must be positive, got {hidden_size}")
         if moe_intermediate_size <= 0:
-            raise ValueError(f"moe_intermediate_size must be positive, got {moe_intermediate_size}")
+            raise ValueError(
+                f"moe_intermediate_size must be positive, got {moe_intermediate_size}"
+            )
         if num_experts_per_tok <= 0:
-            raise ValueError(f"num_experts_per_tok must be positive, got {num_experts_per_tok}")
+            raise ValueError(
+                f"num_experts_per_tok must be positive, got {num_experts_per_tok}"
+            )
         if num_experts_per_tok > num_experts:
             raise ValueError(
-                f"num_experts_per_tok ({num_experts_per_tok}) cannot exceed " f"num_experts ({num_experts})"
+                f"num_experts_per_tok ({num_experts_per_tok}) cannot exceed "
+                f"num_experts ({num_experts})"
             )
 
 
@@ -237,8 +278,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
     Base class for MoE CPU inference operations.
     Provides common functionality for all backend implementations.
     """
-
-    _layer_has_pending_deferred: Dict[int, bool] = {}
 
     def __init__(
         self,
@@ -276,7 +315,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
             weight_path: Path to weights
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Whether to save weights to CPU memory
-            max_deferred_experts_per_token: Number of experts per token to defer on this layer. Defaults to 0 (no defer).
+            max_deferred_experts_per_token: Number of lower-scored experts per
+                token to schedule as a tail task on this layer. The tail is
+                completed before this layer returns. Defaults to 0 (no split).
             method: Backend method string
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping.
                         If None, defaults to [0, 1, ..., threadpool_count-1].
@@ -321,10 +362,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.chunked_prefill_size = chunked_prefill_size
         self.cpu_save = cpu_save
         self.max_deferred_experts_per_token = (
-            int(max_deferred_experts_per_token) if max_deferred_experts_per_token is not None else 0
+            int(max_deferred_experts_per_token)
+            if max_deferred_experts_per_token is not None
+            else 0
         )
 
-        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         self.method = method
         # V4-Flash 2604B SwiGLU clamp limit; 0.0 = disabled. NativeMoEWrapper
         # (MXFP4 path) reads this in load_weights() and writes it into
@@ -333,7 +375,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.swiglu_limit = float(swiglu_limit)
 
         # Initialize CPU inference engine (singleton via shared base class)
-        self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
+        self.cpu_infer = self._get_cpu_infer(
+            cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes
+        )
 
         # Backend-specific initialization happens in subclasses
         self.moe = None
@@ -355,7 +399,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
             down_proj: Down projection weights [num_experts, hidden_size, intermediate_size]
             physical_to_logical_map_cpu: Mapping from physical to logical expert IDs
         """
-        pass
 
     @abstractmethod
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
@@ -365,7 +408,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
         Args:
             physical_to_logical_map_cpu: Mapping from physical to logical expert IDs
         """
-        pass
 
     def select_deferred_experts(
         self,
@@ -382,14 +424,37 @@ class BaseMoEWrapper(_MoEBase, ABC):
             immediate_ids = torch.full_like(expert_ids, -1)
             return immediate_ids, deferred_ids
 
-        topk_result = torch.topk(expert_scores, k=protected_k, dim=-1, largest=True, sorted=False)
+        topk_result = torch.topk(
+            expert_scores, k=protected_k, dim=-1, largest=True, sorted=False
+        )
         protected_indices = topk_result.indices
         protected_ids = torch.gather(expert_ids, -1, protected_indices)
 
-        protected_flag = torch.zeros((self.num_experts,), dtype=torch.int32, device=device)
-        protected_flag.scatter_(0, protected_ids.reshape(-1), 1)
+        # EP wrappers map experts that are not owned by the CPU complement to
+        # -1.  Keep those sentinel entries out of scatter/gather: CUDA treats
+        # a negative scatter index as a device-side assertion rather than the
+        # Python-style wraparound used by ordinary tensor indexing.
+        valid_expert_ids = (expert_ids >= 0) & (expert_ids < self.num_experts)
+        valid_protected_ids = (protected_ids >= 0) & (protected_ids < self.num_experts)
+        # Reserve one fixed sentinel slot instead of compacting the valid IDs
+        # with boolean indexing.  Boolean indexing has a data-dependent output
+        # shape and is therefore illegal while SGLang captures a full decode
+        # CUDA graph.  The extra slot keeps every scatter/gather shape static
+        # while preventing invalid routes from aliasing logical expert zero.
+        sentinel_expert_id = self.num_experts
+        safe_protected_ids = protected_ids.masked_fill(
+            ~valid_protected_ids, sentinel_expert_id
+        )
+        protected_flag = torch.zeros(
+            (self.num_experts + 1,), dtype=torch.int32, device=device
+        )
+        protected_flag.scatter_(0, safe_protected_ids.reshape(-1), 1)
 
-        protected_mask_flat = torch.gather(protected_flag, 0, expert_ids.reshape(-1)).ne(0)
+        safe_expert_ids = expert_ids.masked_fill(~valid_expert_ids, sentinel_expert_id)
+        protected_mask_flat = torch.gather(
+            protected_flag, 0, safe_expert_ids.reshape(-1)
+        ).ne(0)
+        protected_mask_flat &= valid_expert_ids.reshape(-1)
         protected_mask = protected_mask_flat.view(batch, topk)
 
         immediate_ids = expert_ids.clone().masked_fill(~protected_mask, -1)
@@ -414,7 +479,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
             cuda_stream: CUDA stream for synchronization
         """
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        batch_size = flat_hidden_states.shape[0]
 
         (
             input_tensor_cpu,
@@ -427,8 +491,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
         ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
-        next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
-
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
         topk_ids_long = topk_ids.to(torch.long)
@@ -437,7 +499,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         if self.max_deferred_experts_per_token > 0:
             protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
 
-            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+            immediate_ids, deferred_ids = self.select_deferred_experts(
+                topk_ids_long, topk_weights, protected_k
+            )
         else:
             immediate_ids = topk_ids_long
             deferred_ids = None
@@ -446,7 +510,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
         weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
         immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
 
-        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
         self.cpu_infer.submit_with_cuda_stream(
             cuda_stream,
             self.moe.forward_task(
@@ -456,13 +519,24 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 weights_cpu[current_slot].data_ptr(),
                 input_tensor_cpu[current_slot].data_ptr(),
                 output_cpu[current_slot].data_ptr(),
-                incremental,
+                False,
             ),
         )
 
-        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         if deferred_ids is not None:
-            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+            deferred_experts_ids_cpu[current_slot].copy_(
+                deferred_ids, non_blocking=True
+            )
+            # The old scheduler wrote this tail into the next layer's slot and
+            # let sync_forward return while it was still pending.  The next
+            # layer then folded that stale contribution into its own MoE
+            # output.  Besides making the result depend on cross-stream task
+            # timing, that is not a legal transformer reschedule: layer L+1
+            # must consume layer L's complete result.
+            #
+            # Keep the useful high-score/tail partition, but finish the tail
+            # in FIFO order into this layer's output.  All kt-kernel backends
+            # implement incremental merge as ``output = output + task``.
             self.cpu_infer.submit_with_cuda_stream(
                 cuda_stream,
                 self.moe.forward_task(
@@ -471,11 +545,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
                     deferred_experts_ids_cpu[current_slot].data_ptr(),
                     weights_cpu[current_slot].data_ptr(),
                     input_tensor_cpu[current_slot].data_ptr(),
-                    output_cpu[next_slot].data_ptr(),
-                    False,
+                    output_cpu[current_slot].data_ptr(),
+                    True,
                 ),
             )
-            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def sync_forward(
         self,
@@ -507,8 +580,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
         ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
-        allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
-        self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        # Returning before the tail task completes changes model semantics and
+        # also exposes the shared ring slot to the following layer.  Drain the
+        # queue before copying this layer's complete CPU contribution out.
+        self.cpu_infer.sync_with_cuda_stream(cuda_stream)
         if output_tensor is None:
             current_output = output_gpu[current_slot]
             if (

@@ -406,7 +406,7 @@ wrapper = KTMoEWrapper(
     chunked_prefill_size=512,
     method="AMXINT4",
     cpu_save=False,  # 加载后是否将权重常驻 CPU 内存
-    max_deferred_experts_per_token=0  # 每个 token 延迟的 experts 数量（用于流水线）
+    max_deferred_experts_per_token=0  # 作为同层尾部任务运行的低分 expert 数量
 )
 
 # 为特定 batch size 预分配缓冲区（提升性能）
