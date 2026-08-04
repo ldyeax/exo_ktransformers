@@ -28,6 +28,13 @@ option(KTRANSFORMERS_CPU_MOE_AMD "ktransformers: CPU use moe kernel for amd" OFF
 option(KTRANSFORMERS_ENABLE_CPPTRACE "Enable native crash tracing in kt-kernel" OFF)
 # LTO control
 option(CPUINFER_ENABLE_LTO "Enable link time optimization (IPO)" OFF)
+set(KT_MXFP4_N_BLOCK "128" CACHE STRING
+    "AVX-512 native-MXFP4 output-row block (64, 96, 128, or 256)")
+set_property(CACHE KT_MXFP4_N_BLOCK PROPERTY STRINGS 64 96 128 256)
+if(NOT KT_MXFP4_N_BLOCK MATCHES "^(64|96|128|256)$")
+    message(FATAL_ERROR
+        "KT_MXFP4_N_BLOCK must be one of 64, 96, 128, or 256; got ${KT_MXFP4_N_BLOCK}")
+endif()
 
 project(kt_kernel_ext VERSION 0.6.1)
 
@@ -547,6 +554,16 @@ message(STATUS "SOURCE_DIR7: ${SOURCE_DIR7}")
 
 
 set(ALL_SOURCES ${SOURCE_DIR1} ${SOURCE_DIR2} ${SOURCE_DIR3} ${SOURCE_DIR4} ${SOURCE_DIR5} ${SOURCE_DIR6} ${SOURCE_DIR7})
+
+# fp4-moe.hpp is instantiated only by the extension binding translation unit.
+# Keeping this definition source-local lets N-block experiments reuse every
+# unrelated native object while still making the selected value auditable in
+# the extension telemetry.
+set_source_files_properties(
+    "${CMAKE_CURRENT_SOURCE_DIR}/ext_bindings.cpp"
+    PROPERTIES COMPILE_DEFINITIONS "KT_MXFP4_N_BLOCK=${KT_MXFP4_N_BLOCK}"
+)
+message(STATUS "MXFP4 AVX N block: ${KT_MXFP4_N_BLOCK}")
 
 file(GLOB_RECURSE FMT_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"

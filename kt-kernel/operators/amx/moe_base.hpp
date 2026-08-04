@@ -77,6 +77,17 @@ class AMX_MOE_BASE {
   void* down_ba_pool_ = nullptr;
   void* down_bc_pool_ = nullptr;
 
+  struct alignas(64) FineGrainedCounter {
+    std::atomic<int> value{0};
+  };
+  struct alignas(64) FineGrainedFlag {
+    std::atomic<bool> value{false};
+  };
+  int fine_grained_gate_nth_ = 0;
+  std::unique_ptr<FineGrainedCounter[]> fine_grained_gate_up_slice_done_;
+  std::unique_ptr<FineGrainedCounter[]> fine_grained_activation_done_;
+  std::unique_ptr<FineGrainedFlag[]> fine_grained_down_pack_done_;
+
   GeneralMOEConfig config_;
   using input_t = ggml_bf16_t;
   using output_t = float;
@@ -119,6 +130,11 @@ class AMX_MOE_BASE {
     m_local_gate_output_ptr_.resize(config_.expert_num);
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
+    fine_grained_gate_nth_ = T::recommended_nth(config_.intermediate_size);
+    fine_grained_gate_up_slice_done_ =
+        std::make_unique<FineGrainedCounter[]>(static_cast<size_t>(config_.expert_num) * fine_grained_gate_nth_);
+    fine_grained_activation_done_ = std::make_unique<FineGrainedCounter[]>(config_.expert_num);
+    fine_grained_down_pack_done_ = std::make_unique<FineGrainedFlag[]>(config_.expert_num);
 
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
@@ -202,7 +218,118 @@ class AMX_MOE_BASE {
     derived_const()->write_weights_to_bf16_buffer(std::forward<Args>(args)...);
   }
 
+  void run_fused_activation_graph(int activated_expert, int qlen) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    static std::atomic<bool> logged_fused_dispatch{false};
+    if (!logged_fused_dispatch.exchange(true, std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "[KT][AMX] first fused activation expert graph "
+                   "(qlen=%d experts=%d)\n",
+                   qlen, activated_expert);
+    }
+
+    const int gate_nth = T::recommended_nth(config_.intermediate_size);
+    const int down_nth = T::recommended_nth(config_.hidden_size);
+    const int gate_tasks_per_expert = gate_nth;
+    const int up_activation_tasks_per_expert = gate_nth;
+    const int up_activation_offset = activated_expert * gate_tasks_per_expert;
+    const int down_offset = up_activation_offset + activated_expert * up_activation_tasks_per_expert;
+    const int task_count = down_offset + activated_expert * down_nth;
+
+    assert(gate_nth == fine_grained_gate_nth_);
+    auto* gate_slice_done = fine_grained_gate_up_slice_done_.get();
+    auto* activation_done = fine_grained_activation_done_.get();
+    auto* down_pack_done = fine_grained_down_pack_done_.get();
+    for (int i = 0; i < activated_expert * gate_nth; i++) {
+      gate_slice_done[i].value.store(0, std::memory_order_relaxed);
+    }
+    for (int i = 0; i < activated_expert; i++) {
+      activation_done[i].value.store(0, std::memory_order_relaxed);
+      down_pack_done[i].value.store(false, std::memory_order_relaxed);
+    }
+
+    auto wait_for_count = [](const std::atomic<int>& counter, int target) {
+      int spins = 0;
+      while (counter.load(std::memory_order_acquire) < target) {
+        _mm_pause();
+        if (++spins == 4096) {
+          std::this_thread::yield();
+          spins = 0;
+        }
+      }
+    };
+    auto wait_for_flag = [](const std::atomic<bool>& flag) {
+      int spins = 0;
+      while (!flag.load(std::memory_order_acquire)) {
+        _mm_pause();
+        if (++spins == 4096) {
+          std::this_thread::yield();
+          spins = 0;
+        }
+      }
+    };
+
+    // Preserve separate gate and up tasks so both weight streams retain the
+    // full worker-level parallelism needed by bandwidth-bound MXFP4.  Fuse
+    // only the cheap SwiGLU slice into the up task, after its matching gate
+    // slice completes.  Stage-major task ids guarantee every gate producer is
+    // assigned before an up waiter can be assigned, avoiding a pool deadlock.
+    // The last activated slice packs the down input in-place.  Compared with
+    // the regular fine graph this removes gate_nth activation tasks and one
+    // down-pack task per active expert without changing GEMM reduction order.
+    pool->do_work_stealing_job(
+        task_count, [](int _) { T::config(); },
+        [this, qlen, gate_nth, down_nth, gate_tasks_per_expert, up_activation_tasks_per_expert,
+         up_activation_offset, down_offset, gate_slice_done, activation_done, down_pack_done, &wait_for_count,
+         &wait_for_flag](int task_id) {
+          if (task_id < up_activation_offset) {
+            const int expert_order = task_id / gate_tasks_per_expert;
+            const int ith = task_id % gate_tasks_per_expert;
+            const int expert_idx = m_expert_id_map_[expert_order];
+
+            derived()->do_gate_up_gemm(false, expert_idx, ith, gate_nth, qlen);
+            gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith,
+                                         gate_nth);
+            gate_slice_done[expert_order * gate_nth + ith].value.store(1, std::memory_order_release);
+            return;
+          }
+
+          if (task_id < down_offset) {
+            const int up_activation_task = task_id - up_activation_offset;
+            const int expert_order = up_activation_task / up_activation_tasks_per_expert;
+            const int ith = up_activation_task % up_activation_tasks_per_expert;
+            const int expert_idx = m_expert_id_map_[expert_order];
+
+            derived()->do_gate_up_gemm(true, expert_idx, ith, gate_nth, qlen);
+            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, gate_nth);
+            wait_for_count(gate_slice_done[expert_order * gate_nth + ith].value, 1);
+            apply_activation_slice(expert_idx, ith, gate_nth);
+
+            const int completed = activation_done[expert_order].value.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (completed == gate_nth) {
+              down_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], 0, 1);
+              down_pack_done[expert_order].value.store(true, std::memory_order_release);
+            }
+            return;
+          }
+
+          const int down_task = task_id - down_offset;
+          const int expert_order = down_task / down_nth;
+          const int ith = down_task % down_nth;
+          const int expert_idx = m_expert_id_map_[expert_order];
+          wait_for_flag(down_pack_done[expert_order].value);
+          derived()->do_down_gemm(expert_idx, ith, down_nth, qlen);
+          down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, down_nth);
+        },
+        nullptr);
+  }
+
   void run_fine_grained_expert_graph(int activated_expert, int qlen) {
+    const char* fused_env = std::getenv("KT_AMX_FUSED_ACTIVATION");
+    if (fused_env != nullptr && std::strcmp(fused_env, "1") == 0) {
+      run_fused_activation_graph(activated_expert, qlen);
+      return;
+    }
     auto pool = config_.pool->get_subpool(tp_part_idx);
     if (qlen > 1) {
       static std::atomic<bool> logged_prefill_dispatch{false};
@@ -224,15 +351,16 @@ class AMX_MOE_BASE {
     const int down_offset = down_pack_offset + activated_expert * down_pack_tasks_per_expert;
     const int task_count = down_offset + activated_expert * down_tasks_per_expert;
 
-    std::vector<std::atomic<int>> gate_up_slice_done(activated_expert * gate_nth);
-    std::vector<std::atomic<int>> activation_done(activated_expert);
-    std::vector<std::atomic<bool>> down_pack_done(activated_expert);
-    for (auto& done : gate_up_slice_done) {
-      done.store(0, std::memory_order_relaxed);
+    assert(gate_nth == fine_grained_gate_nth_);
+    auto* gate_up_slice_done = fine_grained_gate_up_slice_done_.get();
+    auto* activation_done = fine_grained_activation_done_.get();
+    auto* down_pack_done = fine_grained_down_pack_done_.get();
+    for (int i = 0; i < activated_expert * gate_nth; i++) {
+      gate_up_slice_done[i].value.store(0, std::memory_order_relaxed);
     }
     for (int i = 0; i < activated_expert; i++) {
-      activation_done[i].store(0, std::memory_order_relaxed);
-      down_pack_done[i].store(false, std::memory_order_relaxed);
+      activation_done[i].value.store(0, std::memory_order_relaxed);
+      down_pack_done[i].value.store(false, std::memory_order_relaxed);
     }
 
     auto wait_for_count = [](const std::atomic<int>& counter, int target) {
@@ -264,8 +392,8 @@ class AMX_MOE_BASE {
     pool->do_work_stealing_job(
         task_count, [](int _) { T::config(); },
         [this, qlen, gate_nth, down_nth, gate_tasks_per_expert, activation_tasks_per_expert, down_pack_tasks_per_expert,
-         down_tasks_per_expert, activation_offset, down_pack_offset, down_offset, &gate_up_slice_done, &activation_done,
-         &down_pack_done, &wait_for_count, &wait_for_flag](int task_id) {
+         down_tasks_per_expert, activation_offset, down_pack_offset, down_offset, gate_up_slice_done, activation_done,
+         down_pack_done, &wait_for_count, &wait_for_flag](int task_id) {
           if (task_id < activation_offset) {
             const int expert_order = task_id / gate_tasks_per_expert;
             const int local_gate_task = task_id % gate_tasks_per_expert;
@@ -280,7 +408,7 @@ class AMX_MOE_BASE {
               gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith,
                                            gate_nth);
             }
-            gate_up_slice_done[expert_order * gate_nth + ith].fetch_add(1, std::memory_order_acq_rel);
+            gate_up_slice_done[expert_order * gate_nth + ith].value.fetch_add(1, std::memory_order_acq_rel);
             return;
           }
 
@@ -289,9 +417,9 @@ class AMX_MOE_BASE {
             const int expert_order = activation_task / activation_tasks_per_expert;
             const int ith = activation_task % activation_tasks_per_expert;
             const int expert_idx = m_expert_id_map_[expert_order];
-            wait_for_count(gate_up_slice_done[expert_order * gate_nth + ith], 2);
+            wait_for_count(gate_up_slice_done[expert_order * gate_nth + ith].value, 2);
             apply_activation_slice(expert_idx, ith, gate_nth);
-            activation_done[expert_order].fetch_add(1, std::memory_order_acq_rel);
+            activation_done[expert_order].value.fetch_add(1, std::memory_order_acq_rel);
             return;
           }
 
@@ -299,9 +427,9 @@ class AMX_MOE_BASE {
             const int down_pack_task = task_id - down_pack_offset;
             const int expert_order = down_pack_task / down_pack_tasks_per_expert;
             const int expert_idx = m_expert_id_map_[expert_order];
-            wait_for_count(activation_done[expert_order], activation_tasks_per_expert);
+            wait_for_count(activation_done[expert_order].value, activation_tasks_per_expert);
             down_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], 0, 1);
-            down_pack_done[expert_order].store(true, std::memory_order_release);
+            down_pack_done[expert_order].value.store(true, std::memory_order_release);
             return;
           }
 
@@ -309,7 +437,7 @@ class AMX_MOE_BASE {
           const int expert_order = down_task / down_tasks_per_expert;
           const int ith = down_task % down_tasks_per_expert;
           const int expert_idx = m_expert_id_map_[expert_order];
-          wait_for_flag(down_pack_done[expert_order]);
+          wait_for_flag(down_pack_done[expert_order].value);
           derived()->do_down_gemm(expert_idx, ith, down_nth, qlen);
           down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, down_nth);
         },

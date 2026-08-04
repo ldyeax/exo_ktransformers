@@ -12,8 +12,8 @@ from ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=20, suite="default")
 
 try:
-    import torch
     import kt_kernel
+    import torch
 
     kt_kernel_ext = kt_kernel.kt_kernel_ext
     HAS_AMX_BF16 = hasattr(kt_kernel_ext.moe, "AMXBF16_MOE")
@@ -23,7 +23,10 @@ except ImportError:
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("num_threads", [2, 8])
-def test_fine_grained_decode_matches_staged_decode(num_threads: int) -> None:
+@pytest.mark.parametrize("token_count", [1, 2, 4])
+def test_fine_grained_decode_matches_staged_decode(
+    num_threads: int, token_count: int
+) -> None:
     if not HAS_AMX_BF16:
         pytest.skip("AMX BF16 extension is unavailable")
 
@@ -48,12 +51,22 @@ def test_fine_grained_decode_matches_staged_decode(num_threads: int) -> None:
         dtype=torch.bfloat16,
         generator=generator,
     ).contiguous()
-    expert_ids = torch.tensor([[7, 1, 4, 2]], dtype=torch.int64)
-    weights = torch.tensor([[0.125, 0.25, 0.375, 0.25]], dtype=torch.float32)
+    base_expert_ids = torch.tensor([7, 1, 4, 2], dtype=torch.int64)
+    expert_ids = torch.stack(
+        [torch.roll(base_expert_ids, shifts=token) for token in range(token_count)]
+    )
+    weights = torch.tensor(
+        [[0.125, 0.25, 0.375, 0.25]] * token_count, dtype=torch.float32
+    )
     input_data = (
-        torch.randn((1, hidden_size), dtype=torch.bfloat16, generator=generator) / 100
+        torch.randn(
+            (token_count, hidden_size),
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        / 100
     ).contiguous()
-    batch_size = torch.tensor([1], dtype=torch.int64)
+    batch_size = torch.tensor([token_count], dtype=torch.int64)
     physical_to_logical_map = torch.arange(expert_num, dtype=torch.int64)
 
     cpu_infer = kt_kernel_ext.CPUInfer(num_threads)
@@ -74,12 +87,19 @@ def test_fine_grained_decode_matches_staged_decode(num_threads: int) -> None:
     cpu_infer.submit(moe.load_weights_task(physical_to_logical_map.data_ptr()))
     cpu_infer.sync()
 
-    def run_decode(fine_grained: bool) -> torch.Tensor:
-        if fine_grained:
-            os.environ["KT_AMX_FINE_GRAINED_DECODE"] = "1"
-        else:
+    def run_decode(mode: str) -> torch.Tensor:
+        if mode == "staged":
             os.environ.pop("KT_AMX_FINE_GRAINED_DECODE", None)
-        output = torch.empty((1, hidden_size), dtype=torch.bfloat16)
+            os.environ.pop("KT_AMX_FUSED_ACTIVATION", None)
+        elif mode == "fine_grained":
+            os.environ["KT_AMX_FINE_GRAINED_DECODE"] = "1"
+            os.environ.pop("KT_AMX_FUSED_ACTIVATION", None)
+        elif mode == "fused":
+            os.environ["KT_AMX_FINE_GRAINED_DECODE"] = "1"
+            os.environ["KT_AMX_FUSED_ACTIVATION"] = "1"
+        else:
+            raise ValueError(f"unknown decode mode: {mode}")
+        output = torch.empty((token_count, hidden_size), dtype=torch.bfloat16)
         cpu_infer.submit(
             moe.forward_task(
                 batch_size.data_ptr(),
@@ -95,9 +115,16 @@ def test_fine_grained_decode_matches_staged_decode(num_threads: int) -> None:
         return output
 
     try:
-        staged = run_decode(fine_grained=False)
-        fine_grained = run_decode(fine_grained=True)
+        staged = run_decode("staged")
+        fine_grained = run_decode("fine_grained")
+        fine_grained_reused = run_decode("fine_grained")
+        fused = run_decode("fused")
+        fused_reused = run_decode("fused")
     finally:
         os.environ.pop("KT_AMX_FINE_GRAINED_DECODE", None)
+        os.environ.pop("KT_AMX_FUSED_ACTIVATION", None)
 
     assert torch.equal(fine_grained, staged)
+    assert torch.equal(fine_grained_reused, staged)
+    assert torch.equal(fused, staged)
+    assert torch.equal(fused_reused, staged)

@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -71,6 +72,17 @@ struct alignas(64) ThreadState {
 
 class InNumaPool {
  public:
+  enum class AffinityStatus {
+    CALLER,
+    PENDING,
+    ACTIVE,
+    NUMA_NODE_NOT_FOUND,
+    PROCESSING_UNIT_NOT_FOUND,
+    CPUSET_ALLOCATION_FAILED,
+    BIND_FAILED,
+    VERIFY_FAILED,
+  };
+
   InNumaPool(int thread_count);
   InNumaPool(int max_thread_num, int numa_id, int threads_id_start);
   ~InNumaPool();
@@ -82,6 +94,13 @@ class InNumaPool {
 
   void do_work_stealing_job(int, std::function<void(int)>, std::function<void(int)>, std::function<void(int)>);
   void do_work_stealing_job(int, std::function<void(int)>);
+
+  int configured_worker_count() const;
+  std::vector<int> worker_affinity_cpu_ids() const;
+  std::vector<long> worker_native_thread_ids() const;
+  std::vector<std::string> worker_affinity_statuses() const;
+  long last_caller_native_thread_id() const;
+  int last_caller_cpu_id() const;
 
  private:
   int worker_count;
@@ -98,8 +117,19 @@ class InNumaPool {
   std::atomic<int> curr_;
   int end_;
 
+  std::vector<int> worker_affinity_cpu_ids_;
+  std::vector<AffinityStatus> worker_affinity_statuses_;
+  std::unique_ptr<std::atomic<long>[]> worker_native_thread_ids_;
+  std::atomic<long> last_caller_native_thread_id_{-1};
+  std::atomic<int> last_caller_cpu_id_{-1};
+  std::mutex worker_startup_mutex_;
+  std::condition_variable worker_startup_cv_;
+  int started_background_worker_count_ = 0;
+
   void process_tasks(int);
   void worker_thread(int, int);
+  void stop_and_join_workers() noexcept;
+  static const char* affinity_status_name(AffinityStatus);
 };
 
 class NumaJobDistributor {
@@ -107,14 +137,24 @@ class NumaJobDistributor {
   NumaJobDistributor(int numa_count);
   NumaJobDistributor(std::vector<int> numa_ids);
   NumaJobDistributor(std::vector<int> numa_ids, std::vector<int> thread_count);
+  NumaJobDistributor(std::vector<int> numa_ids, std::vector<int> thread_count, bool single_numa_inline_dispatch);
 
   ~NumaJobDistributor();
 
   void do_numa_job(std::function<void(int)>);
 
+  bool single_numa_inline_dispatch_active() const;
+  int physical_numa_id() const;
+  size_t distributor_worker_count() const;
+  unsigned long long inline_dispatch_count() const;
+  unsigned long long inline_exception_count() const;
+  long last_inline_native_thread_id() const;
+  int last_inline_cpu_id() const;
+  int last_inline_worker_pool_thread_id() const;
+
  private:
   void init(std::vector<int> numa_ids);
-  void init(std::vector<int> numa_ids, std::vector<int> thread_count);
+  void init(std::vector<int> numa_ids, std::vector<int> thread_count, bool single_numa_inline_dispatch = false);
 
   std::unique_ptr<std::barrier<>> ready_bar;
 
@@ -125,6 +165,14 @@ class NumaJobDistributor {
   std::vector<std::unique_ptr<std::condition_variable>> cvs;
   std::function<void(int)> compute_func;
   std::vector<std::thread> workers;
+
+  bool single_numa_inline_dispatch_active_ = false;
+  int physical_numa_id_ = -1;
+  std::atomic<unsigned long long> inline_dispatch_count_{0};
+  std::atomic<unsigned long long> inline_exception_count_{0};
+  std::atomic<long> last_inline_native_thread_id_{-1};
+  std::atomic<int> last_inline_cpu_id_{-1};
+  std::atomic<int> last_inline_worker_pool_thread_id_{-1};
 
   void worker_thread(int);
 };
@@ -153,6 +201,24 @@ class WorkerPool {
   void do_work_stealing_job(int, std::function<void(int)>, std::function<void(int)>, std::function<void(int)>);
   void do_work_stealing_job(int, std::function<void(int)>);
 
+  bool single_numa_inline_dispatch_environment_enabled() const;
+  bool single_numa_inline_dispatch_eligible() const;
+  bool single_numa_inline_dispatch_requested() const;
+  bool single_numa_inline_dispatch_active() const;
+  const char* single_numa_inline_dispatch_status() const;
+  int single_numa_inline_dispatch_physical_numa_id() const;
+  size_t single_numa_inline_dispatch_worker_count() const;
+  unsigned long long single_numa_inline_dispatch_count() const;
+  unsigned long long single_numa_inline_exception_count() const;
+  long single_numa_inline_dispatch_last_native_thread_id() const;
+  int single_numa_inline_dispatch_last_cpu_id() const;
+  int single_numa_inline_dispatch_last_worker_pool_thread_id() const;
+  std::vector<int> subpool_worker_affinity_cpu_ids(int subpool_index) const;
+  std::vector<long> subpool_worker_native_thread_ids(int subpool_index) const;
+  std::vector<std::string> subpool_worker_affinity_statuses(int subpool_index) const;
+  long subpool_last_caller_native_thread_id(int subpool_index) const;
+  int subpool_last_caller_cpu_id(int subpool_index) const;
+
   WorkerPoolConfig config;
 
  private:
@@ -162,6 +228,9 @@ class WorkerPool {
   int numa_count;
   int threads_per_numa;
   std::unique_ptr<NumaJobDistributor> distributor;
+
+  bool single_numa_inline_dispatch_environment_enabled_ = false;
+  bool single_numa_inline_dispatch_eligible_ = false;
 
   std::vector<std::unique_ptr<InNumaPool>> numa_worker_pools;
 };

@@ -8,6 +8,8 @@
  * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
  **/
 // Python bindings
+#include <sched.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -15,6 +17,7 @@
 #if defined(KTRANSFORMERS_ENABLE_CPPTRACE)
 #include <cpptrace/cpptrace.hpp>
 #endif
+#include <algorithm>
 #include <csignal>
 #include <cstddef>
 #include <cstring>
@@ -492,6 +495,154 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<WorkerPoolConfig>())
       .def("submit", &CPUInfer::submit)
       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
+      .def("task_queue_affinity",
+           [](const CPUInfer& cpuinfer) {
+             py::dict telemetry;
+             telemetry["environment_enabled"] = cpuinfer.task_queue_affinity_environment_enabled();
+             telemetry["eligible_single_numa_subpool"] = cpuinfer.task_queue_affinity_eligible();
+             telemetry["requested"] = cpuinfer.task_queue_affinity_requested();
+             telemetry["active"] = cpuinfer.task_queue_affinity_active();
+             telemetry["status"] = cpuinfer.task_queue_affinity_status();
+             telemetry["numa_id"] = cpuinfer.task_queue_affinity_numa_id();
+             telemetry["cpu_id"] = cpuinfer.task_queue_affinity_cpu_id();
+             telemetry["native_thread_id"] = cpuinfer.task_queue_affinity_native_thread_id();
+             return telemetry;
+           })
+      .def("single_numa_inline_dispatch",
+           [](const CPUInfer& cpuinfer) {
+             py::dict telemetry;
+             const unsigned long long dispatch_count = cpuinfer.single_numa_inline_dispatch_count();
+             const long last_native_thread_id = cpuinfer.single_numa_inline_dispatch_last_native_thread_id();
+             const int last_cpu_id = cpuinfer.single_numa_inline_dispatch_last_cpu_id();
+             const bool task_queue_match =
+                 dispatch_count > 0 && last_native_thread_id == cpuinfer.task_queue_affinity_native_thread_id();
+             const bool task_queue_cpu_match =
+                 dispatch_count > 0 && last_cpu_id == cpuinfer.task_queue_affinity_cpu_id();
+             const bool logical_worker_zero =
+                 dispatch_count > 0 && cpuinfer.single_numa_inline_dispatch_last_worker_pool_thread_id() == 0;
+             telemetry["environment_enabled"] = cpuinfer.single_numa_inline_dispatch_environment_enabled();
+             telemetry["eligible_single_numa_subpool"] = cpuinfer.single_numa_inline_dispatch_eligible();
+             telemetry["requested"] = cpuinfer.single_numa_inline_dispatch_requested();
+             telemetry["active"] = cpuinfer.single_numa_inline_dispatch_active();
+             telemetry["status"] = cpuinfer.single_numa_inline_dispatch_status();
+             telemetry["physical_numa_id"] = cpuinfer.single_numa_inline_dispatch_physical_numa_id();
+             telemetry["configured_worker_count"] = cpuinfer.backend_->get_thread_num();
+             telemetry["distributor_worker_count"] = cpuinfer.single_numa_inline_dispatch_worker_count();
+             telemetry["distributor_thread_elided"] = cpuinfer.single_numa_inline_dispatch_worker_count() == 0;
+             telemetry["dispatch_count"] = dispatch_count;
+             telemetry["exception_count"] = cpuinfer.single_numa_inline_dispatch_exception_count();
+             telemetry["last_native_thread_id"] = last_native_thread_id;
+             telemetry["last_cpu_id"] = last_cpu_id;
+             telemetry["last_worker_pool_thread_id"] =
+                 cpuinfer.single_numa_inline_dispatch_last_worker_pool_thread_id();
+             telemetry["task_queue_native_thread_id"] = cpuinfer.task_queue_affinity_native_thread_id();
+             telemetry["task_queue_cpu_id"] = cpuinfer.task_queue_affinity_cpu_id();
+             telemetry["task_queue_affinity_active"] = cpuinfer.task_queue_affinity_active();
+             telemetry["last_dispatch_on_task_queue_thread"] = task_queue_match;
+             telemetry["last_dispatch_on_task_queue_cpu"] = task_queue_cpu_match;
+             telemetry["logical_worker_zero_proven"] = logical_worker_zero && task_queue_match && task_queue_cpu_match;
+             telemetry["collision_free_worker_zero"] = cpuinfer.single_numa_inline_dispatch_active() &&
+                                                       cpuinfer.task_queue_affinity_active() &&
+                                                       cpuinfer.single_numa_inline_dispatch_worker_count() == 0;
+             return telemetry;
+           })
+      .def("worker_pool_affinity",
+           [](const CPUInfer& cpuinfer) {
+             py::dict telemetry;
+             py::list subpools;
+             bool all_bindings_active = true;
+             bool all_bindings_unique = true;
+             bool all_bindings_on_expected_numa = true;
+             for (int subpool_index = 0; subpool_index < cpuinfer.backend_->config.subpool_count; ++subpool_index) {
+               std::vector<int> cpu_ids = cpuinfer.backend_->subpool_worker_affinity_cpu_ids(subpool_index);
+               std::vector<long> native_thread_ids = cpuinfer.backend_->subpool_worker_native_thread_ids(subpool_index);
+               std::vector<std::string> statuses = cpuinfer.backend_->subpool_worker_affinity_statuses(subpool_index);
+               std::vector<std::string> roles(statuses.size(), "background_worker");
+               if (!roles.empty()) roles[0] = "external_caller_worker0";
+               if (cpuinfer.single_numa_inline_dispatch_active() && subpool_index == 0 &&
+                   cpuinfer.task_queue_affinity_active() && !cpu_ids.empty()) {
+                 cpu_ids[0] = cpuinfer.task_queue_affinity_cpu_id();
+                 native_thread_ids[0] = cpuinfer.task_queue_affinity_native_thread_id();
+                 statuses[0] = "active";
+                 roles[0] = "inline_task_queue_worker0";
+               }
+
+               int active_worker_count = 0;
+               std::vector<int> active_cpu_ids;
+               const int expected_numa_id = cpuinfer.backend_->config.subpool_numa_map[subpool_index];
+               for (size_t worker_index = 0; worker_index < statuses.size(); ++worker_index) {
+                 if (statuses[worker_index] == "active") {
+                   ++active_worker_count;
+                   active_cpu_ids.push_back(cpu_ids[worker_index]);
+                   if (cpu_ids[worker_index] < 0 || numa_node_of_cpu(cpu_ids[worker_index]) != expected_numa_id) {
+                     all_bindings_on_expected_numa = false;
+                   }
+                 } else {
+                   all_bindings_active = false;
+                 }
+               }
+               std::sort(active_cpu_ids.begin(), active_cpu_ids.end());
+               if (std::adjacent_find(active_cpu_ids.begin(), active_cpu_ids.end()) != active_cpu_ids.end()) {
+                 all_bindings_unique = false;
+               }
+
+               py::dict subpool;
+               subpool["logical_subpool_index"] = subpool_index;
+               subpool["physical_numa_id"] = expected_numa_id;
+               subpool["configured_worker_count"] = static_cast<int>(statuses.size());
+               subpool["active_worker_count"] = active_worker_count;
+               subpool["worker_cpu_ids"] = cpu_ids;
+               subpool["worker_native_thread_ids"] = native_thread_ids;
+               subpool["worker_affinity_statuses"] = statuses;
+               subpool["worker_roles"] = roles;
+               subpool["last_caller_native_thread_id"] =
+                   cpuinfer.backend_->subpool_last_caller_native_thread_id(subpool_index);
+               subpool["last_caller_cpu_id"] = cpuinfer.backend_->subpool_last_caller_cpu_id(subpool_index);
+               subpools.append(std::move(subpool));
+             }
+             telemetry["subpool_count"] = cpuinfer.backend_->config.subpool_count;
+             telemetry["configured_worker_count"] = cpuinfer.backend_->get_thread_num();
+             telemetry["subpools"] = std::move(subpools);
+             telemetry["all_worker_bindings_active"] = all_bindings_active;
+             telemetry["all_worker_cpu_ids_unique"] = all_bindings_unique;
+             telemetry["all_workers_on_expected_numa"] = all_bindings_on_expected_numa;
+             return telemetry;
+           })
+      .def(
+          "probe_single_numa_inline_dispatch",
+          [](CPUInfer& cpuinfer, int task_count) {
+            if (!cpuinfer.single_numa_inline_dispatch_active()) {
+              throw std::runtime_error("single-NUMA inline dispatch is not active");
+            }
+            if (task_count <= 0 || task_count > cpuinfer.backend_->get_thread_num()) {
+              throw std::invalid_argument("task_count must be in [1, configured_worker_count]");
+            }
+            std::vector<long> worker_native_thread_ids(task_count, -1);
+            std::vector<int> worker_cpu_ids(task_count, -1);
+            std::atomic<int> executed_task_count{0};
+            cpuinfer.task_queue_->enqueue([&] {
+              cpuinfer.backend_->dispense_backend()->do_numa_job([&](int subpool_index) {
+                cpuinfer.backend_->get_subpool(subpool_index)
+                    ->do_work_stealing_job(
+                        task_count,
+                        [&](int logical_worker_id) {
+                          worker_native_thread_ids[logical_worker_id] = static_cast<long>(syscall(SYS_gettid));
+                          worker_cpu_ids[logical_worker_id] = sched_getcpu();
+                        },
+                        [&](int) { executed_task_count.fetch_add(1, std::memory_order_relaxed); }, nullptr);
+              });
+            });
+            {
+              py::gil_scoped_release release;
+              cpuinfer.task_queue_->sync(0);
+            }
+            py::dict result;
+            result["executed_task_count"] = executed_task_count.load(std::memory_order_acquire);
+            result["worker_native_thread_ids"] = std::move(worker_native_thread_ids);
+            result["worker_cpu_ids"] = std::move(worker_cpu_ids);
+            return result;
+          },
+          py::arg("task_count"))
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
@@ -499,6 +650,141 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
 #endif
       ;
+
+#if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL) && defined(__AVX512F__)
+  m.def("mxfp4_avx_scale_fold_telemetry", [] {
+    using Kernel = amx::GemmKernel224MXFP4SmallKGroup;
+    const auto& configuration = Kernel::avx_scale_fold_configuration();
+    const uint64_t decode_dispatches =
+        Kernel::avx512_decode_dispatches.load(std::memory_order_relaxed);
+    const uint64_t prefill_dispatches =
+        Kernel::avx512_prefill_dispatches.load(std::memory_order_relaxed);
+    const uint64_t total_dispatches = decode_dispatches + prefill_dispatches;
+    const uint64_t lut_decode_dispatches =
+        Kernel::scale_fold_lut_decode_dispatches.load(
+            std::memory_order_relaxed);
+    const uint64_t lut_prefill_dispatches =
+        Kernel::scale_fold_lut_prefill_dispatches.load(
+            std::memory_order_relaxed);
+    const uint64_t exponent_decode_dispatches =
+        Kernel::scale_fold_exponent_decode_dispatches.load(
+            std::memory_order_relaxed);
+    const uint64_t exponent_prefill_dispatches =
+        Kernel::scale_fold_exponent_prefill_dispatches.load(
+            std::memory_order_relaxed);
+    const uint64_t fallback_decode_dispatches =
+        Kernel::scale_fold_fallback_decode_dispatches.load(
+            std::memory_order_relaxed);
+    const uint64_t fallback_prefill_dispatches =
+        Kernel::scale_fold_fallback_prefill_dispatches.load(
+            std::memory_order_relaxed);
+    const uint64_t lut_dispatches =
+        lut_decode_dispatches + lut_prefill_dispatches;
+    const uint64_t exponent_dispatches =
+        exponent_decode_dispatches + exponent_prefill_dispatches;
+    const uint64_t scale_fold_dispatches =
+        lut_dispatches + exponent_dispatches;
+    const uint64_t fallback_dispatches =
+        fallback_decode_dispatches + fallback_prefill_dispatches;
+    const uint64_t constructed_buffers =
+        Kernel::scale_fold_buffers_constructed.load(std::memory_order_relaxed);
+    const uint64_t finalized_buffers =
+        Kernel::scale_fold_buffers_finalized.load(std::memory_order_relaxed);
+    const uint64_t admitted_buffers =
+        Kernel::scale_fold_buffers_admitted.load(std::memory_order_relaxed);
+    const uint64_t rejected_buffers =
+        Kernel::scale_fold_buffers_rejected.load(std::memory_order_relaxed);
+    const uint64_t unsafe_scale_bytes =
+        Kernel::scale_fold_unsafe_scale_bytes.load(std::memory_order_relaxed);
+    const uint64_t nan_scale_bytes =
+        Kernel::scale_fold_nan_scale_bytes.load(std::memory_order_relaxed);
+    const uint64_t invalid_mode_requests =
+        Kernel::scale_fold_invalid_mode_requests.load(
+            std::memory_order_relaxed);
+    const uint64_t scale_bytes_audited =
+        Kernel::scale_fold_scale_bytes_audited.load(
+            std::memory_order_relaxed);
+    const bool fold_requested =
+        configuration.mode != amx::MXFP4AVXScaleFoldMode::kOff;
+    const bool whole_buffer_domain_finalized =
+        constructed_buffers > 0 && finalized_buffers == constructed_buffers;
+    const bool whole_buffer_domain_admitted =
+        !fold_requested ||
+        (whole_buffer_domain_finalized && admitted_buffers == finalized_buffers &&
+         rejected_buffers == 0);
+
+    std::string execution_mode = "not-executed";
+    if (total_dispatches > 0) {
+      if (lut_dispatches == total_dispatches) {
+        execution_mode = "lut-v1";
+      } else if (exponent_dispatches == total_dispatches) {
+        execution_mode = "exponent-v1";
+      } else if (fallback_dispatches == total_dispatches) {
+        execution_mode = "fallback-off";
+      } else if (scale_fold_dispatches == 0 && fallback_dispatches == 0) {
+        execution_mode = "off";
+      } else {
+        execution_mode = "mixed";
+      }
+    }
+
+    py::dict telemetry;
+    telemetry["schema_version"] = 1;
+    telemetry["requested_mode"] = configuration.raw;
+    telemetry["configuration_valid"] = configuration.valid;
+    telemetry["architecture_supported"] =
+        Kernel::AVX_SCALE_FOLD_ARCHITECTURE_SUPPORTED;
+    telemetry["execution_mode"] = execution_mode;
+    telemetry["n_block"] = Kernel::N_BLOCK;
+    telemetry["fold_safe_minimum"] = Kernel::SCALE_FOLD_SAFE_MINIMUM;
+    telemetry["fold_safe_maximum"] = Kernel::SCALE_FOLD_SAFE_MAXIMUM;
+    telemetry["lut_identity"] = std::string(Kernel::SCALE_FOLD_LUT_IDENTITY);
+    telemetry["lut_hash_algorithm"] = "fnv1a64-le";
+    telemetry["lut_hash"] = Kernel::scale_fold_lut_hash();
+    telemetry["lut_bytes"] = sizeof(Kernel::fp4_scaled_bf16_lut);
+    telemetry["buffers_constructed"] = constructed_buffers;
+    telemetry["buffers_finalized"] = finalized_buffers;
+    telemetry["buffers_admitted"] = admitted_buffers;
+    telemetry["buffers_rejected"] = rejected_buffers;
+    telemetry["whole_buffer_domain_finalized"] =
+        whole_buffer_domain_finalized;
+    telemetry["whole_buffer_domain_admitted"] =
+        whole_buffer_domain_admitted;
+    telemetry["scale_bytes_audited"] = scale_bytes_audited;
+    telemetry["unsafe_scale_bytes"] = unsafe_scale_bytes;
+    telemetry["nan_scale_bytes"] = nan_scale_bytes;
+    telemetry["invalid_mode_requests"] = invalid_mode_requests;
+    if (scale_bytes_audited > 0) {
+      telemetry["observed_scale_minimum"] =
+          Kernel::scale_fold_observed_minimum.load(std::memory_order_relaxed);
+      telemetry["observed_scale_maximum"] =
+          Kernel::scale_fold_observed_maximum.load(std::memory_order_relaxed);
+    } else {
+      telemetry["observed_scale_minimum"] = py::none();
+      telemetry["observed_scale_maximum"] = py::none();
+    }
+    telemetry["decode_dispatch_count"] = decode_dispatches;
+    telemetry["prefill_dispatch_count"] = prefill_dispatches;
+    telemetry["real_dispatch_count"] = total_dispatches;
+    telemetry["scale_fold_dispatch_count"] = scale_fold_dispatches;
+    telemetry["lut_decode_dispatch_count"] = lut_decode_dispatches;
+    telemetry["lut_prefill_dispatch_count"] = lut_prefill_dispatches;
+    telemetry["exponent_decode_dispatch_count"] =
+        exponent_decode_dispatches;
+    telemetry["exponent_prefill_dispatch_count"] =
+        exponent_prefill_dispatches;
+    telemetry["fallback_dispatch_count"] = fallback_dispatches;
+    telemetry["fallback_decode_dispatch_count"] =
+        fallback_decode_dispatches;
+    telemetry["fallback_prefill_dispatch_count"] =
+        fallback_prefill_dispatches;
+    telemetry["zero_invalid_or_fallback_counts"] =
+        configuration.valid && invalid_mode_requests == 0 &&
+        rejected_buffers == 0 && unsafe_scale_bytes == 0 &&
+        nan_scale_bytes == 0 && fallback_dispatches == 0;
+    return telemetry;
+  });
+#endif
 
   auto linear_module = m.def_submodule("linear");
   py::class_<LinearConfig>(linear_module, "LinearConfig")

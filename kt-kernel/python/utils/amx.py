@@ -252,6 +252,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
+        swiglu_limit: float = 0.0,
+        swiglu_alpha: float = 0.0,
     ):
         """
         Initialize AMX MoE Wrapper.
@@ -274,6 +276,15 @@ class AMXMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token: Number of experts per token to defer. Defaults to 0.
             method: AMX quantization method ("AMXINT4" or "AMXINT8")
         """
+        if swiglu_limit != 0.0 and method != "AMXINT4":
+            raise ValueError(
+                f"AMXMoEWrapper received swiglu_limit={swiglu_limit} with "
+                f"method={method!r}; only AMXINT4 is qualified for the "
+                "DSV4 split-tier clamp path."
+            )
+        self.swiglu_limit = float(swiglu_limit)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.threadpool_count = int(threadpool_count)
         if method == "AMXINT4" and not _HAS_AMXINT4_SUPPORT:
             raise RuntimeError(
                 "AMXINT4 backend not available. Required ISA:\n"
@@ -511,6 +522,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
+        moe_config.swiglu_limit = self.swiglu_limit
+        moe_config.swiglu_alpha = self.swiglu_alpha
 
         # Enable save mode for online quantization
         moe_config.save = True
@@ -558,6 +571,77 @@ class AMXMoEWrapper(BaseMoEWrapper):
         if self.load_merged_weight:
             base_key = f"blk.{self.layer_idx}"
             w = self.safetensor_loader.load_experts(base_key)
+            required_tables = (
+                "gate",
+                "up",
+                "down",
+                "gate_scale",
+                "up_scale",
+                "down_scale",
+            )
+            table_counts = {
+                table_name: len(w.get(table_name, ()))
+                for table_name in required_tables
+            }
+            if any(
+                table_count != self.threadpool_count
+                for table_count in table_counts.values()
+            ):
+                raise ValueError(
+                    "AMXINT4 artifact NUMA table count must exactly match "
+                    f"threadpool_count={self.threadpool_count}; observed "
+                    f"{table_counts}. Rank-local EP pools require an artifact "
+                    "exported with one full-width NUMA table per rank."
+                )
+
+            weight_expert_ids = getattr(self, "weight_expert_ids", None)
+            if weight_expert_ids is not None:
+                if self.share_host_weights:
+                    raise SharedHostWeightError(
+                        "compact AMXINT4 expert selection cannot be combined "
+                        "with KT_SHARED_HOST_WEIGHTS"
+                    )
+                if not isinstance(weight_expert_ids, torch.Tensor):
+                    raise TypeError("weight_expert_ids must be a torch.Tensor")
+                expert_ids = weight_expert_ids.to(
+                    device="cpu", dtype=torch.int64
+                ).tolist()
+                if len(expert_ids) != self.num_experts:
+                    raise ValueError(
+                        "AMXMoEWrapper shard size does not match num_experts: "
+                        f"ids={len(expert_ids)} num_experts={self.num_experts}"
+                    )
+                source_expert_count = len(w["gate"][0])
+                if len(set(expert_ids)) != len(expert_ids) or any(
+                    expert_id < 0 or expert_id >= source_expert_count
+                    for expert_id in expert_ids
+                ):
+                    raise ValueError(
+                        "AMXMoEWrapper weight_expert_ids must be unique and in "
+                        f"[0, {source_expert_count})"
+                    )
+                for table_name in required_tables:
+                    if any(
+                        len(numa_table) != source_expert_count
+                        for numa_table in w[table_name]
+                    ):
+                        raise ValueError(
+                            f"AMXINT4 {table_name} expert tables have "
+                            "inconsistent source widths"
+                        )
+                    w[table_name] = [
+                        [numa_table[expert_id] for expert_id in expert_ids]
+                        for numa_table in w[table_name]
+                    ]
+                physical_to_logical_map_cpu = torch.arange(
+                    self.num_experts, dtype=torch.int64, device="cpu"
+                )
+                logger.info(
+                    "[KT] AMXINT4 expert shard layer=%d local=%d source=%d",
+                    self.layer_idx,
+                    self.num_experts,
+                    source_expert_count,
+                )
             if self.share_host_weights:
                 self._validate_shared_host_weight_tables(w)
 
@@ -610,6 +694,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
+        moe_config.swiglu_limit = self.swiglu_limit
+        moe_config.swiglu_alpha = self.swiglu_alpha
 
         moe_config.gate_proj = gate_ptr
         moe_config.up_proj = up_ptr

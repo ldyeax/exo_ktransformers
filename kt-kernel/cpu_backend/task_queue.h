@@ -20,12 +20,34 @@
 
 class TaskQueue {
  public:
+  enum class AffinityStatus {
+    NOT_REQUESTED,
+    PENDING,
+    ACTIVE,
+    TOPOLOGY_INIT_FAILED,
+    TOPOLOGY_LOAD_FAILED,
+    NUMA_NODE_NOT_FOUND,
+    CORE_NOT_FOUND,
+    CPUSET_ALLOCATION_FAILED,
+    EMPTY_CPUSET,
+    BIND_FAILED,
+    VERIFY_FAILED,
+  };
+
   TaskQueue();
+  explicit TaskQueue(int first_core_numa_id);
   ~TaskQueue();
 
   void enqueue(std::function<void()>);
 
   void sync(size_t allow_n_pending);
+
+  bool affinity_requested() const;
+  bool affinity_active() const;
+  int affinity_numa_id() const;
+  int affinity_cpu_id() const;
+  long affinity_native_thread_id() const;
+  const char* affinity_status() const;
 
  private:
   struct Node {
@@ -43,7 +65,19 @@ class TaskQueue {
   std::mutex mtx;
   std::condition_variable cv;
 
+  std::mutex startup_mtx;
+  std::condition_variable startup_cv;
+  bool startup_complete = false;
+  AffinityStatus affinity_status_ = AffinityStatus::NOT_REQUESTED;
+  int affinity_errno_ = 0;
+  int affinity_numa_id_ = -1;
+  int affinity_cpu_id_ = -1;
+  long affinity_native_thread_id_ = -1;
+
   void worker();
+  void pinned_worker(int);
+  void process_tasks();
+  void delete_nodes();
 };
 
 #endif

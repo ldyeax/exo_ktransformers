@@ -9,18 +9,54 @@
  *   Weight:   FP4 E2M1 (nibble-packed, same layout) → PSHUFB lookup → BF16
  *   Act:      BF16 direct (BufferABF16Impl, no online INT8 quantization)
  *   Dot prod: _mm512_dpbf16_ps (BF16×BF16→FP32) instead of _mm512_dpbssd_epi32
- *   Scale:    FP32 per-group scale (weight only, no activation scale)
+ *   Scale:    OCP UE8M0 per-group scale (weight only, no activation scale)
  **/
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
 namespace amx {
+
+enum class MXFP4AVXScaleFoldMode : uint8_t {
+  kOff = 0,
+  kLutV1 = 1,
+  kExponentV1 = 2,
+};
+
+constexpr std::string_view mxfp4_avx_scale_fold_mode_name(
+    MXFP4AVXScaleFoldMode mode) {
+  switch (mode) {
+    case MXFP4AVXScaleFoldMode::kOff:
+      return "off";
+    case MXFP4AVXScaleFoldMode::kLutV1:
+      return "lut-v1";
+    case MXFP4AVXScaleFoldMode::kExponentV1:
+      return "exponent-v1";
+  }
+  return "invalid";
+}
+
+#ifndef KT_MXFP4_N_BLOCK
+#define KT_MXFP4_N_BLOCK 128
+#endif
 
 template <typename K>
 struct BufferBMXFP4KGroupImpl {
@@ -28,6 +64,13 @@ struct BufferBMXFP4KGroupImpl {
   dt* b;
   uint8_t* d;
   int n, k, k_group_size, k_group_count;
+  MXFP4AVXScaleFoldMode avx_scale_fold_mode =
+      MXFP4AVXScaleFoldMode::kOff;
+  bool avx_scale_domain_finalized = false;
+  uint8_t avx_scale_minimum = 255;
+  uint8_t avx_scale_maximum = 0;
+  uint64_t avx_scale_unsafe_count = 0;
+  uint64_t avx_scale_nan_count = 0;
 
   static constexpr int N_STEP = K::N_STEP;
   static constexpr int K_STEP = K::K_STEP;
@@ -50,6 +93,7 @@ struct BufferBMXFP4KGroupImpl {
     k_group_count = k / k_group_size;
     b = reinterpret_cast<dt*>(ptr);
     d = reinterpret_cast<uint8_t*>(offset_pointer(b, n * k / 2));
+    K::scale_fold_buffers_constructed.fetch_add(1, std::memory_order_relaxed);
   }
 
   void from_raw_mat(uint8_t* proj, int ith, int nth) {
@@ -73,6 +117,51 @@ struct BufferBMXFP4KGroupImpl {
     return d + static_cast<size_t>(n_begin) * (k_arg / k_group_size) +
            k_begin / k_group_size;
   }
+
+  void finalize_avx_scale_fold_domain(MXFP4AVXScaleFoldMode requested_mode) {
+    if (avx_scale_domain_finalized) {
+      throw std::runtime_error(
+          "MXFP4 AVX scale-fold domain was finalized more than once");
+    }
+    avx_scale_domain_finalized = true;
+    K::scale_fold_buffers_finalized.fetch_add(1, std::memory_order_relaxed);
+
+    if (requested_mode == MXFP4AVXScaleFoldMode::kOff) return;
+
+    const size_t scale_count = static_cast<size_t>(n) * k_group_count;
+    uint8_t minimum = 255;
+    uint8_t maximum = 0;
+    uint64_t unsafe_count = 0;
+    uint64_t nan_count = 0;
+    for (size_t index = 0; index < scale_count; ++index) {
+      const uint8_t scale = d[index];
+      minimum = std::min(minimum, scale);
+      maximum = std::max(maximum, scale);
+      unsafe_count += static_cast<uint64_t>(scale < K::SCALE_FOLD_SAFE_MINIMUM ||
+                                           scale > K::SCALE_FOLD_SAFE_MAXIMUM);
+      nan_count += static_cast<uint64_t>(scale == K::E8M0_NAN_ENCODING);
+    }
+    avx_scale_minimum = minimum;
+    avx_scale_maximum = maximum;
+    avx_scale_unsafe_count = unsafe_count;
+    avx_scale_nan_count = nan_count;
+    K::record_scale_fold_domain(scale_count, minimum, maximum, unsafe_count,
+                                nan_count);
+
+    if constexpr (K::AVX_SCALE_FOLD_ARCHITECTURE_SUPPORTED) {
+      if (unsafe_count == 0) {
+        avx_scale_fold_mode = requested_mode;
+        K::scale_fold_buffers_admitted.fetch_add(1,
+                                                 std::memory_order_relaxed);
+        return;
+      }
+    }
+    K::scale_fold_buffers_rejected.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void finalize_avx_scale_fold_domain() {
+    finalize_avx_scale_fold_domain(K::requested_avx_scale_fold_mode());
+  }
 };
 
 // ============================================================================
@@ -87,8 +176,24 @@ struct GemmKernel224MXFP4SmallKGroup {
   static const int N_STEP = 32;
   static const int K_STEP = 32;
 
-  static inline const int N_BLOCK = 128;
-  static inline const int K_BLOCK = 7168;
+  static constexpr int N_BLOCK = KT_MXFP4_N_BLOCK;
+  static constexpr int K_BLOCK = 7168;
+  static_assert(N_BLOCK == 64 || N_BLOCK == 96 || N_BLOCK == 128 ||
+                    N_BLOCK == 256,
+                "KT_MXFP4_N_BLOCK must be one of 64, 96, 128, or 256");
+  static_assert(N_BLOCK % N_STEP == 0,
+                "KT_MXFP4_N_BLOCK must be aligned to the 32-row N step");
+
+  static constexpr uint8_t SCALE_FOLD_SAFE_MINIMUM = 2;
+  static constexpr uint8_t SCALE_FOLD_SAFE_MAXIMUM = 252;
+  static constexpr uint8_t E8M0_NAN_ENCODING = 255;
+#if defined(__AVX512BF16__)
+  static constexpr bool AVX_SCALE_FOLD_ARCHITECTURE_SUPPORTED = true;
+#else
+  static constexpr bool AVX_SCALE_FOLD_ARCHITECTURE_SUPPORTED = false;
+#endif
+  static constexpr std::string_view SCALE_FOLD_LUT_IDENTITY =
+      "mxfp4-e2m1-bf16-ue8m0-lut-v1";
 
   static std::string name() { return "MXFP4_KGROUP"; }
   static int n_block_size(int) { return N_BLOCK; }
@@ -123,6 +228,103 @@ struct GemmKernel224MXFP4SmallKGroup {
   static inline std::atomic<uint64_t> avx512_decode_dispatches{0};
   static inline std::atomic<uint64_t> avx512_prefill_dispatches{0};
   static inline std::atomic<uint64_t> amx_prefill_dispatches{0};
+  static inline std::atomic<uint64_t> scale_fold_buffers_constructed{0};
+  static inline std::atomic<uint64_t> scale_fold_buffers_finalized{0};
+  static inline std::atomic<uint64_t> scale_fold_buffers_admitted{0};
+  static inline std::atomic<uint64_t> scale_fold_buffers_rejected{0};
+  static inline std::atomic<uint64_t> scale_fold_scale_bytes_audited{0};
+  static inline std::atomic<uint64_t> scale_fold_unsafe_scale_bytes{0};
+  static inline std::atomic<uint64_t> scale_fold_nan_scale_bytes{0};
+  static inline std::atomic<uint64_t> scale_fold_invalid_mode_requests{0};
+  static inline std::atomic<uint64_t> scale_fold_lut_decode_dispatches{0};
+  static inline std::atomic<uint64_t> scale_fold_lut_prefill_dispatches{0};
+  static inline std::atomic<uint64_t> scale_fold_exponent_decode_dispatches{0};
+  static inline std::atomic<uint64_t> scale_fold_exponent_prefill_dispatches{0};
+  static inline std::atomic<uint64_t> scale_fold_fallback_decode_dispatches{0};
+  static inline std::atomic<uint64_t> scale_fold_fallback_prefill_dispatches{0};
+  static inline std::atomic<uint8_t> scale_fold_observed_minimum{255};
+  static inline std::atomic<uint8_t> scale_fold_observed_maximum{0};
+
+  struct AVXScaleFoldConfiguration {
+    MXFP4AVXScaleFoldMode mode;
+    bool valid;
+    std::string raw;
+  };
+
+  static const AVXScaleFoldConfiguration& avx_scale_fold_configuration() {
+    static const AVXScaleFoldConfiguration configuration = [] {
+      const char* value = std::getenv("KT_MXFP4_AVX_SCALE_FOLD_MODE");
+      const std::string raw =
+          value == nullptr || *value == '\0' ? "off" : value;
+      if (raw == "off") {
+        return AVXScaleFoldConfiguration{
+            MXFP4AVXScaleFoldMode::kOff, true, raw};
+      }
+      if (raw == "lut-v1") {
+        return AVXScaleFoldConfiguration{
+            MXFP4AVXScaleFoldMode::kLutV1, true, raw};
+      }
+      if (raw == "exponent-v1") {
+        return AVXScaleFoldConfiguration{
+            MXFP4AVXScaleFoldMode::kExponentV1, true, raw};
+      }
+      return AVXScaleFoldConfiguration{
+          MXFP4AVXScaleFoldMode::kOff, false, raw};
+    }();
+    return configuration;
+  }
+
+  static MXFP4AVXScaleFoldMode requested_avx_scale_fold_mode() {
+    const AVXScaleFoldConfiguration& configuration =
+        avx_scale_fold_configuration();
+    if (!configuration.valid) {
+      scale_fold_invalid_mode_requests.store(1, std::memory_order_relaxed);
+      throw std::runtime_error(
+          "KT_MXFP4_AVX_SCALE_FOLD_MODE must be off, lut-v1, or "
+          "exponent-v1; got " +
+          configuration.raw);
+    }
+    if (configuration.mode != MXFP4AVXScaleFoldMode::kOff &&
+        !AVX_SCALE_FOLD_ARCHITECTURE_SUPPORTED) {
+      throw std::runtime_error(
+          "KT_MXFP4_AVX_SCALE_FOLD_MODE requires AVX-512 BF16");
+    }
+    return configuration.mode;
+  }
+
+  static void update_atomic_minimum(std::atomic<uint8_t>& target,
+                                    uint8_t value) {
+    uint8_t current = target.load(std::memory_order_relaxed);
+    while (value < current &&
+           !target.compare_exchange_weak(current, value,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+  }
+
+  static void update_atomic_maximum(std::atomic<uint8_t>& target,
+                                    uint8_t value) {
+    uint8_t current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current, value,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed)) {
+    }
+  }
+
+  static void record_scale_fold_domain(size_t scale_count, uint8_t minimum,
+                                       uint8_t maximum,
+                                       uint64_t unsafe_count,
+                                       uint64_t nan_count) {
+    scale_fold_scale_bytes_audited.fetch_add(scale_count,
+                                             std::memory_order_relaxed);
+    scale_fold_unsafe_scale_bytes.fetch_add(unsafe_count,
+                                            std::memory_order_relaxed);
+    scale_fold_nan_scale_bytes.fetch_add(nan_count,
+                                         std::memory_order_relaxed);
+    update_atomic_minimum(scale_fold_observed_minimum, minimum);
+    update_atomic_maximum(scale_fold_observed_maximum, maximum);
+  }
 
   static int amx_minimum_expert_tokens() {
     static const int threshold = [] {
@@ -155,6 +357,14 @@ struct GemmKernel224MXFP4SmallKGroup {
     return threshold;
   }
 
+  static int current_process_id() {
+#if defined(_WIN32)
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
+  }
+
   // FP4 E2M1 → BF16 LUTs (16 entries each, for PSHUFB within 128-bit lanes)
   // E2M1 values: {0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0}
   alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
@@ -168,6 +378,59 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x8000, 0xbf00, 0xbf80, 0xbfc0, 0xc000, 0xc040, 0xc080, 0xc0c0,
       0x0000, 0x3f00, 0x3f80, 0x3fc0, 0x4000, 0x4040, 0x4080, 0x40c0,
       0x8000, 0xbf00, 0xbf80, 0xbfc0, 0xc000, 0xc040, 0xc080, 0xc0c0};
+
+  // Every admitted UE8M0 scale is a power of two whose product with every
+  // finite E2M1 code remains a normal BF16 value. Pre-folding that exponent
+  // into the 16 E2M1 codepoints removes the scale broadcast and FMA from the
+  // hot loop. Each group-local VDPBF16PS result is still added separately to
+  // preserve the baseline accumulation order. Unsafe rows are poisoned and
+  // are unreachable because a complete BufferB scale scan must pass before
+  // this path is selected.
+  alignas(64) static constexpr std::array<std::array<uint16_t, 32>, 256>
+      fp4_scaled_bf16_lut = []() consteval {
+        std::array<std::array<uint16_t, 32>, 256> table{};
+        for (int scale = 0; scale < 256; ++scale) {
+          for (int code = 0; code < 32; ++code) {
+            const uint16_t base = fp4_bf16_lut[code];
+            if (scale < SCALE_FOLD_SAFE_MINIMUM ||
+                scale > SCALE_FOLD_SAFE_MAXIMUM) {
+              table[scale][code] = 0x7fc0;
+            } else if ((base & 0x7fff) == 0) {
+              table[scale][code] = base;
+            } else {
+              const int adjusted = static_cast<int>(base) +
+                                   (scale - 127) * 128;
+              table[scale][code] = static_cast<uint16_t>(adjusted);
+            }
+          }
+        }
+        return table;
+      }();
+
+  static uint64_t scale_fold_lut_fnv1a64() {
+    // Hash explicit little-endian BF16 bytes so telemetry is stable across
+    // compilers and directly identifies the bytes consumed on x86.
+    static const uint64_t hash = [] {
+      uint64_t value = 14695981039346656037ULL;
+      for (const auto& row : fp4_scaled_bf16_lut) {
+        for (const uint16_t word : row) {
+          value ^= static_cast<uint8_t>(word);
+          value *= 1099511628211ULL;
+          value ^= static_cast<uint8_t>(word >> 8);
+          value *= 1099511628211ULL;
+        }
+      }
+      return value;
+    }();
+    return hash;
+  }
+
+  static std::string scale_fold_lut_hash() {
+    char result[17];
+    std::snprintf(result, sizeof(result), "%016llx",
+                  static_cast<unsigned long long>(scale_fold_lut_fnv1a64()));
+    return result;
+  }
 
   // Original byte-shuffle decoder retained as an independent test oracle.
   __attribute__((always_inline)) static inline __m512i
@@ -222,6 +485,40 @@ struct GemmKernel224MXFP4SmallKGroup {
     return _mm512_permutexvar_epi16(word_indices, lookup);
   }
 
+  __attribute__((always_inline)) static inline __m512i
+  mxfp4_to_scaled_bf16_32_lut(__m128i packed, uint8_t scale) {
+    const __m128i nibble_mask = _mm_set1_epi8(0x0f);
+    const __m128i low = _mm_and_si128(packed, nibble_mask);
+    const __m128i high =
+        _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
+    const __m128i indices_low = _mm_unpacklo_epi8(low, high);
+    const __m128i indices_high = _mm_unpackhi_epi8(low, high);
+    const __m256i byte_indices = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(indices_low), indices_high, 1);
+    const __m512i word_indices = _mm512_cvtepu8_epi16(byte_indices);
+    const __m512i lookup = _mm512_load_si512(
+        reinterpret_cast<const __m512i*>(fp4_scaled_bf16_lut[scale].data()));
+    return _mm512_permutexvar_epi16(word_indices, lookup);
+  }
+
+  __attribute__((always_inline)) static inline __m512i
+  scale_bf16_32_by_ue8m0_exponent(__m512i values, uint8_t scale) {
+    const __m512i magnitudes =
+        _mm512_and_si512(values, _mm512_set1_epi16(0x7fff));
+    const __mmask32 nonzero = _mm512_cmpneq_epi16_mask(
+        magnitudes, _mm512_setzero_si512());
+    const int16_t exponent_delta = static_cast<int16_t>(
+        (static_cast<int>(scale) - 127) * 128);
+    return _mm512_mask_add_epi16(
+        values, nonzero, values, _mm512_set1_epi16(exponent_delta));
+  }
+
+  __attribute__((always_inline)) static inline __m512i
+  mxfp4_to_scaled_bf16_32_exponent(__m128i packed, uint8_t scale) {
+    return scale_bf16_32_by_ue8m0_exponent(mxfp4_to_bf16_32(packed),
+                                           scale);
+  }
+
   struct ActivationBF16 {
     __m512bh a;
 #if !defined(__AVX512BF16__)
@@ -238,20 +535,31 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   };
 
+  template <MXFP4AVXScaleFoldMode mode>
   struct DequantizedWeight {
 #if defined(__AVX512BF16__)
     __m512bh d;
+    __m512 scale_vector;
 #else
     __m512 w_even;
     __m512 w_odd;
+    __m512 scale_vector;
     inline static const __m128i lo_mask = _mm_set1_epi8(0x0F);
     inline static const __m512 lut = _mm512_setr_ps(0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f,
                                                     -1.5f, -2.0f, -3.0f, -4.0f, -6.0f);
 #endif
 
-    __attribute__((always_inline)) DequantizedWeight(__m128i w) {
+    __attribute__((always_inline)) DequantizedWeight(__m128i w,
+                                                     uint8_t scale) {
 #if defined(__AVX512BF16__)
-      d = (__m512bh)mxfp4_to_bf16_32(w);
+      if constexpr (mode == MXFP4AVXScaleFoldMode::kLutV1) {
+        d = (__m512bh)mxfp4_to_scaled_bf16_32_lut(w, scale);
+      } else if constexpr (mode == MXFP4AVXScaleFoldMode::kExponentV1) {
+        d = (__m512bh)mxfp4_to_scaled_bf16_32_exponent(w, scale);
+      } else {
+        d = (__m512bh)mxfp4_to_bf16_32(w);
+        scale_vector = _mm512_set1_ps(ue8m0_to_float(scale));
+      }
 #else
       __m128i lo = _mm_and_si128(w, lo_mask);
       __m128i hi = _mm_and_si128(_mm_srli_epi16(w, 4), lo_mask);
@@ -261,18 +569,39 @@ struct GemmKernel224MXFP4SmallKGroup {
 
       w_even = _mm512_permutexvar_ps(lo_32, lut);
       w_odd = _mm512_permutexvar_ps(hi_32, lut);
+      scale_vector = _mm512_set1_ps(ue8m0_to_float(scale));
 #endif
     }
   };
 
-  __attribute__((always_inline)) static inline __m512 mxfp4_dot_bf16(const DequantizedWeight& w,
-                                                                     const ActivationBF16& act) {
+  template <MXFP4AVXScaleFoldMode mode>
+  __attribute__((always_inline)) static inline __m512 mxfp4_dot_bf16(
+      const DequantizedWeight<mode>& w, const ActivationBF16& act) {
 #if defined(__AVX512BF16__)
     return _mm512_dpbf16_ps(_mm512_setzero_ps(), act.a, w.d);
 #else
     __m512 dot = _mm512_mul_ps(act.a_odd, w.w_odd);
     return _mm512_fmadd_ps(act.a_even, w.w_even, dot);
 #endif
+  }
+
+  template <MXFP4AVXScaleFoldMode mode>
+  __attribute__((always_inline)) static inline __m512 mxfp4_accumulate_bf16(
+      __m512 accumulator, const DequantizedWeight<mode>& weight,
+      const ActivationBF16& activation) {
+#if defined(__AVX512BF16__)
+    if constexpr (mode != MXFP4AVXScaleFoldMode::kOff) {
+      // Retain the baseline's group-local dot rounding before adding it to the
+      // running K-group accumulator. Passing the accumulator directly as the
+      // VDPBF16PS source changes association on rare inputs and is not
+      // bit-identical, even though the folded weight values are exact.
+      return _mm512_add_ps(
+          accumulator,
+          _mm512_dpbf16_ps(_mm512_setzero_ps(), activation.a, weight.d));
+    }
+#endif
+    return _mm512_fmadd_ps(weight.scale_vector,
+                           mxfp4_dot_bf16(weight, activation), accumulator);
   }
 
   // Buffers
@@ -307,23 +636,27 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   __attribute__((always_inline)) static inline float ue8m0_to_float(
       uint8_t scale) {
-    uint32_t bits = static_cast<uint32_t>(scale) << 23;
+    // OCP E8M0 has no zero encoding: byte 0 is 2^-127 and byte 255 is NaN.
+    // Encodings 1..254 map directly to the FP32 exponent field.
+    uint32_t bits = 0;
+    if (scale == 0) {
+      bits = 0x00400000u;
+    } else if (scale == E8M0_NAN_ENCODING) {
+      bits = 0x7fc00000u;
+    } else {
+      bits = static_cast<uint32_t>(scale) << 23;
+    }
     float value;
     std::memcpy(&value, &bits, sizeof(value));
     return value;
   }
 
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
-  static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-                                 int nth) {
-    const uint64_t previous_dispatches =
-        avx512_decode_dispatches.fetch_add(1, std::memory_order_relaxed);
-    if (previous_dispatches == 0) {
-      std::fprintf(stderr,
-                   "[KT][MXFP4] first AVX-512 decode dispatch "
-                   "(m=%d n=%d k=%d group=%d thread=%d/%d)\n",
-                   m, n, k, k_group_size, ith, nth);
-    }
+  template <MXFP4AVXScaleFoldMode scale_fold_mode>
+  static void fp4_mat_vec_kgroup_impl(int m, int n, int k,
+                                      int k_group_size, BufferA* ba,
+                                      BufferB* bb, BufferC* bc, int ith,
+                                      int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
@@ -365,22 +698,22 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
-          const DequantizedWeight d4(w4[g]);
-          const DequantizedWeight d5(w5[g]);
-          const DequantizedWeight d6(w6[g]);
-          const DequantizedWeight d7(w7[g]);
-          acc0 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s0[g])), mxfp4_dot_bf16(d0, a), acc0);
-          acc1 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s1[g])), mxfp4_dot_bf16(d1, a), acc1);
-          acc2 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s2[g])), mxfp4_dot_bf16(d2, a), acc2);
-          acc3 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s3[g])), mxfp4_dot_bf16(d3, a), acc3);
-          acc4 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s4[g])), mxfp4_dot_bf16(d4, a), acc4);
-          acc5 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s5[g])), mxfp4_dot_bf16(d5, a), acc5);
-          acc6 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s6[g])), mxfp4_dot_bf16(d6, a), acc6);
-          acc7 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s7[g])), mxfp4_dot_bf16(d7, a), acc7);
+          const DequantizedWeight<scale_fold_mode> d0(w0[g], s0[g]);
+          const DequantizedWeight<scale_fold_mode> d1(w1[g], s1[g]);
+          const DequantizedWeight<scale_fold_mode> d2(w2[g], s2[g]);
+          const DequantizedWeight<scale_fold_mode> d3(w3[g], s3[g]);
+          const DequantizedWeight<scale_fold_mode> d4(w4[g], s4[g]);
+          const DequantizedWeight<scale_fold_mode> d5(w5[g], s5[g]);
+          const DequantizedWeight<scale_fold_mode> d6(w6[g], s6[g]);
+          const DequantizedWeight<scale_fold_mode> d7(w7[g], s7[g]);
+          acc0 = mxfp4_accumulate_bf16(acc0, d0, a);
+          acc1 = mxfp4_accumulate_bf16(acc1, d1, a);
+          acc2 = mxfp4_accumulate_bf16(acc2, d2, a);
+          acc3 = mxfp4_accumulate_bf16(acc3, d3, a);
+          acc4 = mxfp4_accumulate_bf16(acc4, d4, a);
+          acc5 = mxfp4_accumulate_bf16(acc5, d5, a);
+          acc6 = mxfp4_accumulate_bf16(acc6, d6, a);
+          acc7 = mxfp4_accumulate_bf16(acc7, d7, a);
         }
         reduce8(acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7,
                 c_row + (n_pos - n_start));
@@ -403,14 +736,14 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
-          acc0 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s0[g])), mxfp4_dot_bf16(d0, a), acc0);
-          acc1 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s1[g])), mxfp4_dot_bf16(d1, a), acc1);
-          acc2 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s2[g])), mxfp4_dot_bf16(d2, a), acc2);
-          acc3 = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s3[g])), mxfp4_dot_bf16(d3, a), acc3);
+          const DequantizedWeight<scale_fold_mode> d0(w0[g], s0[g]);
+          const DequantizedWeight<scale_fold_mode> d1(w1[g], s1[g]);
+          const DequantizedWeight<scale_fold_mode> d2(w2[g], s2[g]);
+          const DequantizedWeight<scale_fold_mode> d3(w3[g], s3[g]);
+          acc0 = mxfp4_accumulate_bf16(acc0, d0, a);
+          acc1 = mxfp4_accumulate_bf16(acc1, d1, a);
+          acc2 = mxfp4_accumulate_bf16(acc2, d2, a);
+          acc3 = mxfp4_accumulate_bf16(acc3, d3, a);
         }
         reduce4(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start));
       }
@@ -421,28 +754,73 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s[g])), mxfp4_dot_bf16(d, a), acc);
+          const DequantizedWeight<scale_fold_mode> d(w[g], s[g]);
+          acc = mxfp4_accumulate_bf16(acc, d, a);
         }
         c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
       }
     }
   }
 
+  static void record_avx_scale_fold_dispatch(
+      MXFP4AVXScaleFoldMode execution_mode, bool prefill) {
+    std::atomic<uint64_t>* mode_counter = nullptr;
+    if (execution_mode == MXFP4AVXScaleFoldMode::kLutV1) {
+      mode_counter = prefill ? &scale_fold_lut_prefill_dispatches
+                             : &scale_fold_lut_decode_dispatches;
+    } else if (execution_mode == MXFP4AVXScaleFoldMode::kExponentV1) {
+      mode_counter = prefill ? &scale_fold_exponent_prefill_dispatches
+                             : &scale_fold_exponent_decode_dispatches;
+    } else if (avx_scale_fold_configuration().mode !=
+               MXFP4AVXScaleFoldMode::kOff) {
+      mode_counter = prefill ? &scale_fold_fallback_prefill_dispatches
+                             : &scale_fold_fallback_decode_dispatches;
+    }
+    if (mode_counter != nullptr) {
+      mode_counter->fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size,
+                                 BufferA* ba, BufferB* bb, BufferC* bc,
+                                 int ith, int nth) {
+    const MXFP4AVXScaleFoldMode execution_mode = bb->avx_scale_fold_mode;
+    record_avx_scale_fold_dispatch(execution_mode, false);
+    const uint64_t previous_dispatches =
+        avx512_decode_dispatches.fetch_add(1, std::memory_order_relaxed);
+    if (previous_dispatches == 0) {
+      std::fprintf(
+          stderr,
+          "[KT][MXFP4] first AVX-512 decode dispatch "
+          "(pid=%d m=%d n=%d k=%d group=%d thread=%d/%d scale_fold=%.*s "
+          "domain_finalized=%d n_block=%d)\n",
+          current_process_id(), m, n, k, k_group_size, ith, nth,
+          static_cast<int>(mxfp4_avx_scale_fold_mode_name(execution_mode).size()),
+          mxfp4_avx_scale_fold_mode_name(execution_mode).data(),
+          bb->avx_scale_domain_finalized, N_BLOCK);
+    }
+    switch (execution_mode) {
+      case MXFP4AVXScaleFoldMode::kLutV1:
+        return fp4_mat_vec_kgroup_impl<MXFP4AVXScaleFoldMode::kLutV1>(
+            m, n, k, k_group_size, ba, bb, bc, ith, nth);
+      case MXFP4AVXScaleFoldMode::kExponentV1:
+        return fp4_mat_vec_kgroup_impl<MXFP4AVXScaleFoldMode::kExponentV1>(
+            m, n, k, k_group_size, ba, bb, bc, ith, nth);
+      case MXFP4AVXScaleFoldMode::kOff:
+        return fp4_mat_vec_kgroup_impl<MXFP4AVXScaleFoldMode::kOff>(
+            m, n, k, k_group_size, ba, bb, bc, ith, nth);
+    }
+    throw std::runtime_error("invalid MXFP4 AVX scale-fold execution mode");
+  }
+
   // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
   // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
   // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
-  static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-                                 int nth) {
-    const uint64_t previous_dispatches =
-        avx512_prefill_dispatches.fetch_add(1, std::memory_order_relaxed);
-    if (previous_dispatches == 0) {
-      std::fprintf(stderr,
-                   "[KT][MXFP4] first AVX-512 prefill dispatch "
-                   "(m=%d n=%d k=%d group=%d thread=%d/%d threshold=%d)\n",
-                   m, n, k, k_group_size, ith, nth,
-                   avx_tiled_minimum_expert_tokens());
-    }
+  template <MXFP4AVXScaleFoldMode scale_fold_mode>
+  static void fp4_mat_mat_kgroup_impl(int m, int n, int k,
+                                      int k_group_size, BufferA* ba,
+                                      BufferB* bb, BufferC* bc, int ith,
+                                      int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
@@ -475,22 +853,18 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           // 4 行权重解码一次, MB 个 token 共享
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
-          const __m512 sv0 = _mm512_set1_ps(ue8m0_to_float(s0[g]));
-          const __m512 sv1 = _mm512_set1_ps(ue8m0_to_float(s1[g]));
-          const __m512 sv2 = _mm512_set1_ps(ue8m0_to_float(s2[g]));
-          const __m512 sv3 = _mm512_set1_ps(ue8m0_to_float(s3[g]));
+          const DequantizedWeight<scale_fold_mode> d0(w0[g], s0[g]);
+          const DequantizedWeight<scale_fold_mode> d1(w1[g], s1[g]);
+          const DequantizedWeight<scale_fold_mode> d2(w2[g], s2[g]);
+          const DequantizedWeight<scale_fold_mode> d3(w3[g], s3[g]);
 
-#define V_FMA_ROW(M_I)                                                      \
-  do {                                                                      \
-    const ActivationBF16 a(a_rows[M_I][g]);                                 \
-    acc[M_I][0] = _mm512_fmadd_ps(sv0, mxfp4_dot_bf16(d0, a), acc[M_I][0]); \
-    acc[M_I][1] = _mm512_fmadd_ps(sv1, mxfp4_dot_bf16(d1, a), acc[M_I][1]); \
-    acc[M_I][2] = _mm512_fmadd_ps(sv2, mxfp4_dot_bf16(d2, a), acc[M_I][2]); \
-    acc[M_I][3] = _mm512_fmadd_ps(sv3, mxfp4_dot_bf16(d3, a), acc[M_I][3]); \
+#define V_FMA_ROW(M_I)                                               \
+  do {                                                               \
+    const ActivationBF16 a(a_rows[M_I][g]);                          \
+    acc[M_I][0] = mxfp4_accumulate_bf16(acc[M_I][0], d0, a);         \
+    acc[M_I][1] = mxfp4_accumulate_bf16(acc[M_I][1], d1, a);         \
+    acc[M_I][2] = mxfp4_accumulate_bf16(acc[M_I][2], d2, a);         \
+    acc[M_I][3] = mxfp4_accumulate_bf16(acc[M_I][3], d3, a);         \
   } while (0)
           V_FMA_ROW(0);
           V_FMA_ROW(1);
@@ -512,8 +886,8 @@ struct GemmKernel224MXFP4SmallKGroup {
           __m512 acc = _mm512_setzero_ps();
           for (int g = 0; g < kg_count; g++) {
             const ActivationBF16 a(a_rows[i][g]);
-            const DequantizedWeight d(w[g]);
-            acc = _mm512_fmadd_ps(_mm512_set1_ps(ue8m0_to_float(s[g])), mxfp4_dot_bf16(d, a), acc);
+            const DequantizedWeight<scale_fold_mode> d(w[g], s[g]);
+            acc = mxfp4_accumulate_bf16(acc, d, a);
           }
           c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
         }
@@ -547,28 +921,16 @@ struct GemmKernel224MXFP4SmallKGroup {
           }
         }
         for (int g = 0; g < kg_count; g++) {
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
-          const __m512 sv0 =
-              _mm512_set1_ps(ue8m0_to_float(s0[g]));
-          const __m512 sv1 =
-              _mm512_set1_ps(ue8m0_to_float(s1[g]));
-          const __m512 sv2 =
-              _mm512_set1_ps(ue8m0_to_float(s2[g]));
-          const __m512 sv3 =
-              _mm512_set1_ps(ue8m0_to_float(s3[g]));
+          const DequantizedWeight<scale_fold_mode> d0(w0[g], s0[g]);
+          const DequantizedWeight<scale_fold_mode> d1(w1[g], s1[g]);
+          const DequantizedWeight<scale_fold_mode> d2(w2[g], s2[g]);
+          const DequantizedWeight<scale_fold_mode> d3(w3[g], s3[g]);
           for (int i = 0; i < remaining_m; ++i) {
             const ActivationBF16 a(a_rows[i][g]);
-            acc[i][0] = _mm512_fmadd_ps(
-                sv0, mxfp4_dot_bf16(d0, a), acc[i][0]);
-            acc[i][1] = _mm512_fmadd_ps(
-                sv1, mxfp4_dot_bf16(d1, a), acc[i][1]);
-            acc[i][2] = _mm512_fmadd_ps(
-                sv2, mxfp4_dot_bf16(d2, a), acc[i][2]);
-            acc[i][3] = _mm512_fmadd_ps(
-                sv3, mxfp4_dot_bf16(d3, a), acc[i][3]);
+            acc[i][0] = mxfp4_accumulate_bf16(acc[i][0], d0, a);
+            acc[i][1] = mxfp4_accumulate_bf16(acc[i][1], d1, a);
+            acc[i][2] = mxfp4_accumulate_bf16(acc[i][2], d2, a);
+            acc[i][3] = mxfp4_accumulate_bf16(acc[i][3], d3, a);
           }
         }
         for (int i = 0; i < remaining_m; ++i) {
@@ -587,13 +949,10 @@ struct GemmKernel224MXFP4SmallKGroup {
           acc[i] = _mm512_setzero_ps();
         }
         for (int g = 0; g < kg_count; g++) {
-          const DequantizedWeight d(w[g]);
-          const __m512 sv =
-              _mm512_set1_ps(ue8m0_to_float(s[g]));
+          const DequantizedWeight<scale_fold_mode> d(w[g], s[g]);
           for (int i = 0; i < remaining_m; ++i) {
             const ActivationBF16 a(a_rows[i][g]);
-            acc[i] = _mm512_fmadd_ps(
-                sv, mxfp4_dot_bf16(d, a), acc[i]);
+            acc[i] = mxfp4_accumulate_bf16(acc[i], d, a);
           }
         }
         for (int i = 0; i < remaining_m; ++i) {
@@ -603,6 +962,39 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
       }
     }
+  }
+
+  static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size,
+                                 BufferA* ba, BufferB* bb, BufferC* bc,
+                                 int ith, int nth) {
+    const MXFP4AVXScaleFoldMode execution_mode = bb->avx_scale_fold_mode;
+    record_avx_scale_fold_dispatch(execution_mode, true);
+    const uint64_t previous_dispatches =
+        avx512_prefill_dispatches.fetch_add(1, std::memory_order_relaxed);
+    if (previous_dispatches == 0) {
+      std::fprintf(
+          stderr,
+          "[KT][MXFP4] first AVX-512 prefill dispatch "
+          "(m=%d n=%d k=%d group=%d thread=%d/%d threshold=%d "
+          "scale_fold=%.*s domain_finalized=%d n_block=%d)\n",
+          m, n, k, k_group_size, ith, nth,
+          avx_tiled_minimum_expert_tokens(),
+          static_cast<int>(mxfp4_avx_scale_fold_mode_name(execution_mode).size()),
+          mxfp4_avx_scale_fold_mode_name(execution_mode).data(),
+          bb->avx_scale_domain_finalized, N_BLOCK);
+    }
+    switch (execution_mode) {
+      case MXFP4AVXScaleFoldMode::kLutV1:
+        return fp4_mat_mat_kgroup_impl<MXFP4AVXScaleFoldMode::kLutV1>(
+            m, n, k, k_group_size, ba, bb, bc, ith, nth);
+      case MXFP4AVXScaleFoldMode::kExponentV1:
+        return fp4_mat_mat_kgroup_impl<MXFP4AVXScaleFoldMode::kExponentV1>(
+            m, n, k, k_group_size, ba, bb, bc, ith, nth);
+      case MXFP4AVXScaleFoldMode::kOff:
+        return fp4_mat_mat_kgroup_impl<MXFP4AVXScaleFoldMode::kOff>(
+            m, n, k, k_group_size, ba, bb, bc, ith, nth);
+    }
+    throw std::runtime_error("invalid MXFP4 AVX scale-fold execution mode");
   }
 
   /**
@@ -834,7 +1226,16 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (quant_config.group_size == 0 || quant_config.zero_point) {
       throw std::runtime_error("MXFP4 MoE only supports KGroup FP4");
     }
-    printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+    const amx::MXFP4AVXScaleFoldMode scale_fold_mode =
+        T::requested_avx_scale_fold_mode();
+    const std::string_view scale_fold_name =
+        amx::mxfp4_avx_scale_fold_mode_name(scale_fold_mode);
+    printf(
+        "Creating AMX_FP4_MOE_TP %d at numa %d "
+        "(avx_scale_fold=%.*s n_block=%d lut_hash=%s)\n",
+        tp_part_idx, numa_node_of_cpu(sched_getcpu()),
+        static_cast<int>(scale_fold_name.size()), scale_fold_name.data(),
+        T::N_BLOCK, T::scale_fold_lut_hash().c_str());
   }
 
   ~AMX_FP4_MOE_TP() = default;
@@ -893,6 +1294,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (quant_config.group_size == 0 || quant_config.zero_point)
       throw std::runtime_error("MXFP4 MoE only support KGroup FP4.");
     if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4 MoE only support load native weight.");
+    const amx::MXFP4AVXScaleFoldMode requested_scale_fold_mode =
+        T::requested_avx_scale_fold_mode();
 
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
@@ -927,7 +1330,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     pool->do_work_stealing_job(
         config_.expert_num, nullptr,
-        [this, physical_to_logical_map](int task_id) {
+        [this, physical_to_logical_map, requested_scale_fold_mode](int task_id) {
           uint64_t expert_idx = task_id;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
@@ -943,6 +1346,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                       (uint8_t*)config_.down_scale +
                           (logical_expert_id * scale_elem_count),
                       scale_elem_count);
+          gate_bb_[expert_idx]->finalize_avx_scale_fold_domain(
+              requested_scale_fold_mode);
+          up_bb_[expert_idx]->finalize_avx_scale_fold_domain(
+              requested_scale_fold_mode);
+          down_bb_[expert_idx]->finalize_avx_scale_fold_domain(
+              requested_scale_fold_mode);
         },
         nullptr);
   }

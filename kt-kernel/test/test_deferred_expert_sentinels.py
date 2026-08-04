@@ -79,6 +79,35 @@ def _make_wrapper(
     return wrapper
 
 
+def test_late_capture_registration_promotes_the_live_temp_buffer(
+    monkeypatch,
+) -> None:
+    temp_buffer = _make_buffers(batch_size=1, hidden_size=4, top_k=2)
+    monkeypatch.setattr(KExpertsCPUBuffer, "capture_bs", [])
+    monkeypatch.setattr(KExpertsCPUBuffer, "capture_buffers", {})
+    monkeypatch.setattr(KExpertsCPUBuffer, "temp_bs", 1)
+    monkeypatch.setattr(KExpertsCPUBuffer, "temp_buffer", temp_buffer)
+
+    BaseMoEWrapper.set_capture_batch_sizes([1, 6])
+
+    assert KExpertsCPUBuffer.capture_buffers[1] is temp_buffer
+
+
+def test_registered_temp_hit_promotes_the_live_buffer(monkeypatch) -> None:
+    temp_buffer = _make_buffers(batch_size=1, hidden_size=4, top_k=2)
+    monkeypatch.setattr(KExpertsCPUBuffer, "capture_bs", [1])
+    monkeypatch.setattr(KExpertsCPUBuffer, "capture_buffers", {})
+    monkeypatch.setattr(KExpertsCPUBuffer, "temp_bs", 1)
+    monkeypatch.setattr(KExpertsCPUBuffer, "temp_buffer", temp_buffer)
+
+    returned_buffer = KExpertsCPUBuffer.get_buffer(
+        torch.zeros((1, 4), dtype=torch.bfloat16), num_experts_per_tok=2
+    )
+
+    assert returned_buffer is temp_buffer
+    assert KExpertsCPUBuffer.capture_buffers[1] is temp_buffer
+
+
 def test_select_deferred_experts_ignores_unowned_sentinels() -> None:
     wrapper = SimpleNamespace(num_experts=4)
     expert_ids = torch.tensor([[0, -1, 2], [-1, 1, 3]])
