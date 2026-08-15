@@ -12,4 +12,4 @@
 [submodule "third_party/sglang"]
 	path = third_party/sglang
 	url = https://github.com/ldyeax/exo_sglang.git
-	branch = bundle/glm52-fwuff-sglang
+	branch = exo/dsv4-cumulative-0801
