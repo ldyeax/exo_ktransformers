@@ -52,17 +52,13 @@ Before starting, ensure you have:
    kt version
    ```
 
-3. **Transformers 5.3.0**
+3. **The SGLang-KT inference dependency cohort**
 
-   GLM-5 family deployments require a recent Transformers version. Use the same version as the GLM-5.1 setup unless your SGLang build documents a different requirement:
+   The one-click installer supplies official `transformers==5.12.1` together
+   with the matching Torch 2.11 inference stack. Do not install the SFT-only
+   `transformers-kt` distribution in this environment.
 
-   ```bash
-   pip install transformers==5.3.0
-   ```
-
-   > **Note:** `transformers==5.3.0` may be incompatible with some older models. Use a separate virtual environment for GLM-5/5.1/5.2 if you also serve those models.
-
-4. **CUDA toolkit** - CUDA 12.0+ recommended; CUDA 12.8+ is recommended for FP8 deployments.
+4. **CUDA toolkit** - The current inference cohort targets CUDA 13.x.
 5. **Hugging Face CLI** - For downloading models:
 
    ```bash

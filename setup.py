@@ -4,6 +4,7 @@ Extras:
   - ktransformers[sft] installs transformers-kt + accelerate-kt
   - ktransformers[sglang] installs sglang-kt
 """
+
 from pathlib import Path
 from setuptools import setup
 
@@ -19,6 +20,9 @@ setup(
     ],
     extras_require={
         "sft": [
+            # SFT deliberately remains a separate environment from inference.
+            # transformers-kt is validated with this Torch cohort.
+            "torch==2.9.1",
             "transformers-kt==5.6.0.post1",
             "accelerate-kt==1.14.0.post1",
         ],

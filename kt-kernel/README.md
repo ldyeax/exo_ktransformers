@@ -65,7 +65,7 @@ pip install kt-kernel
 - ✅ **Works on CPU-only systems**: CUDA features automatically disabled when GPU not available
 
 **Requirements:**
-- Python 3.10, 3.11, or 3.12
+- Python 3.11, 3.12, or 3.13
 - Linux x86-64 (manylinux_2_17 compatible)
 - CPU with AVX2 support (Intel Haswell 2013+, AMD Zen+)
 - Optional: NVIDIA GPU with compute capability 8.0+ for CUDA features
@@ -81,16 +81,19 @@ pip install kt-kernel
 **Features:**
 - ✅ **Multi-architecture support**: Single wheel supports SM 80/86/89/90 (Ampere, Ada, Hopper)
 - ✅ **Static CUDA runtime**: No CUDA toolkit installation required
-- ✅ **Broad compatibility**: Works with CUDA 11.8+ and 12.x drivers
-- ✅ **PyTorch compatible**: Works with any PyTorch CUDA variant (cu118, cu121, cu124)
+- ✅ **Current inference cohort**: Built and validated with CUDA 13.x
+- ✅ **PyTorch compatible**: Source packages support the maintained Torch 2.9.1
+  SFT cohort and Torch 2.11 inference cohort; install a wheel built for your
+  Python, Torch, and CUDA ABI.
 
 **Requirements:**
-- Python 3.10, 3.11, or 3.12
+- Python 3.11, 3.12, or 3.13
 - Linux x86-64 (manylinux_2_17 compatible)
 - NVIDIA GPU with compute capability 8.0+ (Ampere or newer)
   - ✅ Supported: A100, RTX 3000/4000 series, H100
   - ❌ Not supported: V100, P100, GTX 1000/2000 series (too old)
-- NVIDIA driver with CUDA 11.8+ or 12.x support (no CUDA toolkit needed)
+- NVIDIA driver compatible with CUDA 13.x (no CUDA toolkit needed for the
+  pre-built wheel)
 
 **GPU Compatibility Matrix:**
 
@@ -104,8 +107,8 @@ pip install kt-kernel
 | Volta | 7.0 | ❌ | V100 |
 
 **CUDA Driver Compatibility (for GPU features):**
-- CUDA 11.8, 11.9, 12.0-12.6+: Full support
-- CUDA 11.0-11.7: Not supported (upgrade driver or use CPU-only)
+- Current inference wheels target CUDA 13.x. Use a CUDA 13-compatible driver,
+  or use a CPU-only installation on systems with older drivers.
 
 **CPU Variants Included:**
 
@@ -272,12 +275,25 @@ Install the kvcache-ai fork of SGLang (required for kt-kernel support):
 pip install kt-kernel sglang-kt
 
 # Option C: From source (editable mode)
-git clone --recursive https://github.com/kvcache-ai/ktransformers.git
+git clone --branch exo/glm52-osdi26-patched --recursive \
+  https://github.com/ldyeax/exo_ktransformers.git ktransformers
 cd ktransformers
 pip install -e "third_party/sglang/python[all]"
 ```
 
 > **Important:** Use `sglang-kt` (kvcache-ai fork), not the official `sglang` package. If you have the official version installed, uninstall it first: `pip uninstall sglang -y`
+
+The SGLang-KT package owns the inference dependency cohort. The current source
+installation resolves Torch 2.11.0, TorchVision 0.26.0, TorchAudio 2.11.0,
+TorchCodec 0.11.1, TorchAO 0.17.0, SGLang Kernel 0.4.5, FlashInfer
+0.6.15.post1, and the official Transformers 5.12.1. KT-Kernel accepts both
+Torch 2.9.1 and 2.11.x so installing it after SGLang-KT does not downgrade
+Torch.
+
+The `ktransformers[sft]` extra is a separate environment: it intentionally
+uses Torch 2.9.1 with `transformers-kt`. Do not combine the `sft` and `sglang`
+extras in one environment; their Torch and Transformers distributions are
+mutually exclusive.
 
 #### 2. Prepare Weights
 

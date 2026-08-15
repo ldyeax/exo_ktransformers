@@ -21,7 +21,9 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
   # Core dependencies
-  "torch==2.9.1",
+  # Inference uses SGLang-KT's exact Torch 2.11 pin. Keep the lower end for
+  # the separate transformers-kt SFT environment, which remains on 2.9.1.
+  "torch>=2.9.1,<2.12",
   "safetensors>=0.4.0",
   "numpy>=1.24.0",
   "triton>=2.0.0",

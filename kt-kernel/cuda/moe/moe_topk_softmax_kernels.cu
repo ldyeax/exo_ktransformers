@@ -19,13 +19,29 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+// CUB 3 removed its legacy named sum/max functors. These local binary
+// functors work with both the older CUB bundled with the Torch 2.9 SFT cohort
+// and the CUB 3 headers used by the Torch 2.11 / CUDA 13 inference cohort.
+struct KTReduceSum {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(const T& left, const T& right) const {
+    return left + right;
+  }
+};
+
+struct KTReduceMax {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(const T& left, const T& right) const {
+    return left < right ? right : left;
+  }
+};
+
 /// Aligned array type
-template <
-    typename T,
-    /// Number of elements in the array
-    int N,
-    /// Alignment requirement in bytes
-    int Alignment = sizeof(T) * N>
+template <typename T,
+          /// Number of elements in the array
+          int N,
+          /// Alignment requirement in bytes
+          int Alignment = sizeof(T) * N>
 class alignas(Alignment) AlignedArray {
   float data[N];
 };
@@ -44,7 +60,6 @@ __launch_bounds__(TPB) __global__
 
   const int thread_row_offset = blockIdx.x * num_cols;
 
-  cub::Sum sum;
   float threadData(-FLT_MAX);
 
   // Don't touch finished rows.
@@ -57,7 +72,7 @@ __launch_bounds__(TPB) __global__
     threadData = max(static_cast<float>(input[idx]), threadData);
   }
 
-  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
+  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, KTReduceMax{});
 
   if (threadIdx.x == 0) {
     float_max = maxElem;
@@ -71,7 +86,7 @@ __launch_bounds__(TPB) __global__
     threadData += exp((static_cast<float>(input[idx]) - float_max));
   }
 
-  const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
+  const auto Z = BlockReduce(tmpStorage).Reduce(threadData, KTReduceSum{});
 
   if (threadIdx.x == 0) {
     normalizing_factor = 1.f / Z;
@@ -86,16 +101,9 @@ __launch_bounds__(TPB) __global__
 }
 
 template <int TPB>
-__launch_bounds__(TPB) __global__ void moeTopK(
-    const float* inputs_after_softmax,
-    const bool* finished,
-    float* output,
-    int* indices,
-    int* source_rows,
-    const int num_experts,
-    const int k,
-    const int start_expert,
-    const int end_expert) {
+__launch_bounds__(TPB) __global__
+    void moeTopK(const float* inputs_after_softmax, const bool* finished, float* output, int* indices, int* source_rows,
+                 const int num_experts, const int k, const int start_expert, const int end_expert) {
   using cub_kvp = cub::KeyValuePair<int, float>;
   using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
   __shared__ typename BlockReduce::TempStorage tmpStorage;
@@ -161,16 +169,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 */
 
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
-    const float* input,
-    const bool* finished,
-    float* output,
-    const int num_rows,
-    int* indices,
-    int* source_rows,
-    const int k,
-    const int start_expert,
-    const int end_expert) {
+__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
+    void topkGatingSoftmax(const float* input, const bool* finished, float* output, const int num_rows, int* indices,
+                           int* source_rows, const int k, const int start_expert, const int end_expert) {
   // We begin by enforcing compile time assertions and setting up compile time constants.
   static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
   static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
@@ -364,17 +365,9 @@ struct TopkConstants {
 }  // namespace detail
 
 template <int EXPERTS, int WARPS_PER_TB>
-void topkGatingSoftmaxLauncherHelper(
-    const float* input,
-    const bool* finished,
-    float* output,
-    int* indices,
-    int* source_row,
-    const int num_rows,
-    const int k,
-    const int start_expert,
-    const int end_expert,
-    cudaStream_t stream) {
+void topkGatingSoftmaxLauncherHelper(const float* input, const bool* finished, float* output, int* indices,
+                                     int* source_row, const int num_rows, const int k, const int start_expert,
+                                     const int end_expert, cudaStream_t stream) {
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
   static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(float) * EXPERTS);
@@ -389,29 +382,14 @@ void topkGatingSoftmaxLauncherHelper(
       input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
 }
 
-#define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)             \
-  topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB>( \
-      gating_output,                                          \
-      nullptr,                                                \
-      topk_weights,                                           \
-      topk_indices,                                           \
-      token_expert_indices,                                   \
-      num_tokens,                                             \
-      topk,                                                   \
-      0,                                                      \
-      num_experts,                                            \
-      stream);
+#define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                                                                    \
+  topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB>(gating_output, nullptr, topk_weights, topk_indices,     \
+                                                             token_expert_indices, num_tokens, topk, 0, num_experts, \
+                                                             stream);
 
-void topkGatingSoftmaxKernelLauncher(
-    const float* gating_output,
-    float* topk_weights,
-    int* topk_indices,
-    int* token_expert_indices,
-    float* softmax_workspace,
-    const int num_tokens,
-    const int num_experts,
-    const int topk,
-    cudaStream_t stream) {
+void topkGatingSoftmaxKernelLauncher(const float* gating_output, float* topk_weights, int* topk_indices,
+                                     int* token_expert_indices, float* softmax_workspace, const int num_tokens,
+                                     const int num_experts, const int topk, cudaStream_t stream) {
   static constexpr int WARPS_PER_TB = 4;
   switch (num_experts) {
     case 1:
@@ -442,30 +420,20 @@ void topkGatingSoftmaxKernelLauncher(
       LAUNCH_SOFTMAX(256, WARPS_PER_TB);
       break;
     default: {
-      TORCH_CHECK(
-          softmax_workspace != nullptr,
-          "softmax_workspace must be provided for num_experts that are not a power of 2.");
+      TORCH_CHECK(softmax_workspace != nullptr,
+                  "softmax_workspace must be provided for num_experts that are not a power of 2.");
       static constexpr int TPB = 256;
       moeSoftmax<TPB><<<num_tokens, TPB, 0, stream>>>(gating_output, nullptr, softmax_workspace, num_experts);
-      moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
-          softmax_workspace,
-          nullptr,
-          topk_weights,
-          topk_indices,
-          token_expert_indices,
-          num_experts,
-          topk,
-          0,
-          num_experts);
+      moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(softmax_workspace, nullptr, topk_weights, topk_indices,
+                                                   token_expert_indices, num_experts, topk, 0, num_experts);
     }
   }
 }
 
-void topk_softmax(
-    torch::Tensor& topk_weights,          // [num_tokens, topk]
-    torch::Tensor& topk_indices,          // [num_tokens, topk]
-    torch::Tensor& token_expert_indices,  // [num_tokens, topk]
-    torch::Tensor& gating_output)         // [num_tokens, num_experts]
+void topk_softmax(torch::Tensor& topk_weights,          // [num_tokens, topk]
+                  torch::Tensor& topk_indices,          // [num_tokens, topk]
+                  torch::Tensor& token_expert_indices,  // [num_tokens, topk]
+                  torch::Tensor& gating_output)         // [num_tokens, num_experts]
 {
   const int num_experts = gating_output.size(-1);
   const int num_tokens = gating_output.numel() / num_experts;
@@ -478,14 +446,7 @@ void topk_softmax(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   torch::Tensor softmax_workspace = torch::empty({workspace_size}, gating_output.options());
-  topkGatingSoftmaxKernelLauncher(
-      gating_output.data_ptr<float>(),
-      topk_weights.data_ptr<float>(),
-      topk_indices.data_ptr<int>(),
-      token_expert_indices.data_ptr<int>(),
-      softmax_workspace.data_ptr<float>(),
-      num_tokens,
-      num_experts,
-      topk,
-      stream);
+  topkGatingSoftmaxKernelLauncher(gating_output.data_ptr<float>(), topk_weights.data_ptr<float>(),
+                                  topk_indices.data_ptr<int>(), token_expert_indices.data_ptr<int>(),
+                                  softmax_workspace.data_ptr<float>(), num_tokens, num_experts, topk, stream);
 }

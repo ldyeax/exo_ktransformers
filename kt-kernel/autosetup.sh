@@ -3,7 +3,9 @@ set -euo pipefail
 shopt -s nullglob
 
 PY_LIST=${PY_LIST:-"3.11 3.12 3.13"}
-TORCH_LIST=${TORCH_LIST:-"2.9.1"}
+# Build the current inference wheel against the same Torch ABI as SGLang-KT.
+# Release automation can still set TORCH_LIST=2.9.1 for the separate SFT cohort.
+TORCH_LIST=${TORCH_LIST:-"2.11.0"}
 WORK_ROOT=${WORK_ROOT:-/mnt/data3/lpl/kt-kernel-autosetup}
 WHEELS_DIR=${WHEELS_DIR:-"$PWD/wheels"}
 PIP_CACHE_DIR=${PIP_CACHE_DIR:-/mnt/data3/lpl/pip-cache}

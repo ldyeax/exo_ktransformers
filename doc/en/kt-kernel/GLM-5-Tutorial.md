@@ -37,13 +37,12 @@ Before starting, ensure you have:
     cd kt-kernel && ./install.sh
     ```
 
-3. **transformers reinstalled**
+3. **The SGLang-KT inference dependency cohort** — the one-click installer
+    supplies official `transformers==5.12.1` with the matching Torch 2.11
+    inference stack. Do not install the SFT-only `transformers-kt`
+    distribution in this environment.
 
-    ```bash
-    pip install git+https://github.com/huggingface/transformers.git
-    ```
-
-4. **CUDA toolkit** - CUDA 12.0+ recommended (12.8+ for best FP8 support)
+4. **CUDA toolkit** - The current inference cohort targets CUDA 13.x.
 5. **Hugging Face CLI** - For downloading models:
    ```bash
    pip install -U huggingface-hub

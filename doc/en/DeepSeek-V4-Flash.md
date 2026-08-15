@@ -38,38 +38,21 @@ This tutorial demonstrates how to run **DeepSeek-V4-Flash** model inference usin
 
 ## Prerequisites
 
-1. **KT-Kernel installed**:
+1. **KTransformers inference stack installed from this checkout**:
    ```bash
-   git clone https://github.com/kvcache-ai/ktransformers.git
+   git clone --branch exo/glm52-osdi26-patched --recursive \
+     https://github.com/ldyeax/exo_ktransformers.git ktransformers
    cd ktransformers
-   git submodule update --init --recursive
-   cd kt-kernel && ./install.sh
+   ./install.sh
    ```
 
-2. **SGLang installed** (kvcache-ai fork):
-   ```bash
-   ./install.sh   # from ktransformers root
-   ```
-
-3. **CUDA 12.8+** and **flashinfer ≥ 0.6.9** (`flashinfer-python` and `flashinfer-cubin` must be the same version):
-   ```bash
-   pip install --upgrade flashinfer-python flashinfer-cubin
-   ```
-   This upgrade is required (even though `sglang-kt` pins `flashinfer_python==0.6.3`) because V4-Flash's MXFP4 MoE module imports `mxfp8_quantize`, `trtllm_fp4_block_scale_routed_moe`, etc., which only exist in flashinfer ≥ 0.6.9.
-
-4. **transformers==4.57.1** (V4-Flash is incompatible with the 5.x series):
-   ```bash
-   pip install "transformers==4.57.1"
-   ```
-   `transformers` 5.x adds default-valued fields to `PretrainedConfig` that make `DeepSeekV4Config`'s dataclass declaration raise `TypeError: non-default argument 'quantization_config' follows default argument` at import time. `sglang-kt`'s pyproject does not pin `transformers`, so a fresh `pip install` will pull the latest 5.x and break server startup; pinning explicitly to `4.57.1` is required until the upstream fix lands.
-
-5. **tilelang** (manual install — required for the NSA sparse-MLA tilelang indexer path used on non-Hopper GPUs):
-   ```bash
-   pip install tilelang "apache-tvm-ffi<0.1.12"
-   ```
-   `sglang-kt`'s pyproject does not declare `tilelang` as a dependency, so `pip install ./python[all]` will not pull it in. Validated with `tilelang==0.1.8`.
-
-   > **Note:** Constrain `apache-tvm-ffi<0.1.12`. The standalone `apache-tvm-ffi` 0.1.12 wheel collides with the TVM FFI runtime bundled inside `tilelang`, so importing `tilelang` aborts with `TypeAttr __ffi_repr__ is already registered for type index 130` and the SGLang scheduler dies on startup. `apache-tvm-ffi==0.1.11` does not register the conflicting attribute and starts cleanly; pin until the upstream duplicate-registration fix lands.
+2. **CUDA 13.x**. The authoritative nested SGLang-KT package supplies the
+   coherent inference dependency cohort: Torch 2.11.0, TorchVision 0.26.0,
+   TorchAudio 2.11.0, TorchCodec 0.11.1, TorchAO 0.17.0, SGLang Kernel 0.4.5,
+   FlashInfer 0.6.15.post1, TileLang 0.1.11 with Apache TVM FFI 0.1.11, and
+   the official Transformers 5.12.1. Do not layer the SFT-only
+   `transformers-kt` package or older manual dependency pins into this
+   inference environment.
 
 
 ## Step 1: Download Model Weights
@@ -186,5 +169,3 @@ The `kt` CLI ships with an OpenAI-compatible chat client that talks to the SGLan
 ```bash
 kt chat --host 127.0.0.1 --port 30000 --temperature 0.7 --max-tokens 2048
 ```
-
-
